@@ -1,0 +1,1601 @@
+/**
+ * The universe explorer's interface.
+ *
+ * This is the composition root: it builds the regions, owns the panels, holds
+ * the shortcut table, and is the only thing space.js has to talk to. The layout
+ * rule it enforces is that nothing is ever placed in the centre column — panels
+ * dock to the left beside the navigation rail, the inspector docks right, the
+ * readouts sit along the bottom, and the middle of the screen belongs to the
+ * view.
+ *
+ * Per-frame work is deliberately small. `frame()` computes a handful of derived
+ * values, hands strings to readouts that compare before writing, and runs the
+ * label layer on a fixed interval rather than every frame. Panels that are
+ * closed do no work at all.
+ */
+
+import { el, text, css, show, append, reconcile } from './dom.js';
+import { createPrefs } from './prefs.js';
+import { createShortcuts, prettyChord } from './shortcuts.js';
+import {
+  panel, slider, check, segmented, createTooltips, createMenu, dialog, icon,
+} from './components.js';
+import { createSearch } from './search.js';
+import { createInspector, describe } from './inspector.js';
+import { createHud, createTimeBar, createScaleBar } from './hud.js';
+import { createLabelLayer } from './labels.js';
+import { createQualityPanel } from './quality-panel.js';
+import { createFlightControls } from './flight-controls.js';
+import { createIntro } from './intro.js';
+import { VIEW_GROUPS } from './view-options.js';
+import { AU_KM, formatDistance } from '../engine/units.js';
+import { platform } from '../engine/platform.js';
+import { CLUSTER_LABELS, NEBULA_LABELS, NEUTRON_LABELS } from '../engine/deep-objects.js';
+
+/**
+ * A touch device gets its own wording throughout this file rather than wording
+ * that covers both.
+ *
+ * The rule is narrow: never name an input the device does not have. A phone has
+ * no wheel to scroll, no second mouse button, and no F11 — and text that offers
+ * them is worse than text that says nothing, because it reads as a feature that
+ * is broken rather than as one that is somewhere else. Everything the
+ * interface says about *what* a control does is unchanged; only the sentences
+ * naming the finger or the key that reaches it differ.
+ */
+const TOUCH = platform.touch;
+
+const CAMERA_MODES = [
+  {
+    value: 'orbit',
+    label: 'Orbit',
+    title: TOUCH
+      ? 'Circle the selected body. Drag to swing around it, pinch to close in.'
+      : 'Circle the selected body. Drag to swing around it, scroll to close in.',
+  },
+  {
+    value: 'free',
+    label: 'Fly',
+    title: TOUCH
+      ? 'Thrust with the flight pad, still measured from the selected body.'
+      : 'Thrust with WASD and Q/E, still measured from the selected body.',
+  },
+  {
+    value: 'track',
+    label: 'Track',
+    title: TOUCH
+      ? 'Thrust with the flight pad, but the view stays locked on the selected body.'
+      : 'Thrust with WASD, but the view stays locked on the selected body.',
+  },
+  {
+    value: 'walk',
+    label: 'Walk',
+    title: TOUCH
+      ? 'Stand on the selected world and walk on it. Flight pad to walk, drag to look round.'
+      : 'Stand on the selected world and walk on it (L), or scroll all the way into the ground. W/S/A/D walk and speed up as you hold them, Shift runs, [ and ] set the pace, the wheel raises your eye and scrolling out far enough takes off.',
+  },
+  {
+    value: 'roam',
+    label: 'Roam',
+    title: TOUCH
+      ? 'Let go of the body entirely and fly through open space. '
+        + 'Drag turns you on the spot, pinch sets your speed.'
+      : 'Let go of the body entirely and fly through open space. '
+        + 'Drag turns you on the spot, the wheel sets your speed.',
+  },
+  {
+    value: 'ship',
+    label: 'Ship',
+    title: TOUCH
+      ? 'Take a ship. W and S set the throttle, A and D turn, Q and E roll; drag to steer, pinch for throttle.'
+      : 'Take a ship (P). W/S throttle, A/D and the arrows steer, Q/E roll, Shift boosts, J engages warp, V switches to the cockpit.',
+  },
+];
+
+/**
+ * Tell the stylesheet it is being touched.
+ *
+ * The 44-point minimum for anything you press is a property of the finger, not
+ * of the window: an iPad is 1024 points across and its buttons need to be just
+ * as big as a phone's, while a desktop window dragged down to 400 points is
+ * still being driven by a mouse and should keep the compact controls it was
+ * designed with. So the size rules hang off this class and the layout rules hang
+ * off a width, which are two different questions and were being answered by one.
+ *
+ * A class rather than `@media (pointer: coarse)` because that query also matches
+ * a touchscreen laptop, and this must not be able to change what a desktop is
+ * given. `platform` is the one thing that knows, and it asks the native shell
+ * before it guesses.
+ *
+ * The sky view reaches the same rules through controls.js, which is the only
+ * thing it loads that this port owns.
+ */
+function markAsTouchDriven() {
+  document.documentElement.classList.add('is-touch');
+}
+
+/**
+ * Ask iOS for the area under the notch and the home indicator.
+ *
+ * The safe-area insets the stylesheet compensates for are all zero unless the
+ * document has said `viewport-fit=cover`. Without it the browser insets the
+ * whole viewport for you: the scene stops at the notch, there are black bars
+ * where the hardware is, and `env(safe-area-inset-top)` correctly reports that
+ * nothing is overlapping anything. That is a defensible layout for a document
+ * and the wrong one for this, which is a single full-bleed view of a scene with
+ * an instrument panel floating over it — the scene should run under the notch
+ * and only the panel should avoid it.
+ *
+ * Done here rather than in the markup because it is a consequence of being on a
+ * touch device, which is a thing only the resolved platform knows, and because
+ * it must not change what a desktop browser is handed. Appended rather than
+ * rewritten so that whatever else the tag says survives, and skipped outright if
+ * the property is already there.
+ */
+function askForTheWholeScreen() {
+  const tag = document.querySelector('meta[name="viewport"]');
+  if (!tag || /viewport-fit/.test(tag.content)) return;
+  tag.content = `${tag.content}, viewport-fit=cover`;
+}
+
+export function createExplorerUI(config) {
+  const {
+    root, labelRoot, canvas, controls, camera, state,
+    destinations, quickTargets, resolveWorld, hooks,
+  } = config;
+
+  const prefs = createPrefs();
+  prefs.applyAppearance();
+  if (TOUCH) {
+    markAsTouchDriven();
+    askForTheWholeScreen();
+  }
+  const shortcuts = createShortcuts(prefs);
+  createTooltips();
+  const menu = createMenu();
+
+  // ------------------------------------------------------------------ regions
+
+  const regionTop = el('div', { class: 'region-top' });
+  const regionLeft = el('div', { class: 'region-left' });
+  // The rail and the panels it opens are siblings in a row, and the panels
+  // themselves stack in a column beside it. Without the inner column the panels
+  // would lay out along the rail and march across the middle of the view.
+  const dockLeft = el('div', { class: 'dock' });
+  const regionRight = el('div', { class: 'region-right' });
+  const regionBottom = el('div', { class: 'region-bottom' });
+  const regionCenter = el('div', { class: 'region-center' });
+  const layer = el('div', { class: 'ui-layer' }, [
+    regionTop, regionLeft, regionCenter, regionRight, regionBottom,
+  ]);
+  root.append(layer);
+
+  // ------------------------------------------------------------------ reticle
+
+  const reticle = el('div', { class: 'reticle' });
+  regionCenter.append(reticle);
+
+  const hoverBox = el('div', { class: 'hover-box' });
+  const hoverName = el('div', { class: 'hover-name' });
+  const hover = el('div', { class: 'hover-target', hidden: true }, [hoverBox, hoverName]);
+  document.body.append(hover);
+
+  // ------------------------------------------------------------------- search
+
+  const search = createSearch({
+    destinations,
+    liveDestinations: () => hooks.liveDestinations?.() ?? [],
+    resolve: (key) => {
+      const resolved = resolveWorld(key);
+      if (!resolved) return null;
+      return {
+        ...resolved,
+        cameraDistanceKm: resolved.position.distanceTo(controls.worldPosition),
+      };
+    },
+    craftStatus: (key) => hooks.craftRecord?.(key),
+    onPick: (key) => hooks.selectTarget(key, { fly: true }),
+    onAction: (key, action) => runAction(action, key),
+    prefs,
+  });
+
+  // -------------------------------------------------------------------- panels
+
+  /**
+   * Panels are registered so the rail, the shortcuts and the saved preferences
+   * all address them the same way, and so restoring visibility at startup is one
+   * loop rather than a line per panel.
+   */
+  const panels = new Map();
+
+  /**
+   * Panels start closed on a phone whatever the saved preference says.
+   *
+   * Two of them are open by default, which is right on a monitor: they take a
+   * margin the scene was not using and they are how someone finds out the app
+   * has panels at all. On a 390-point screen there is no margin — a 216-point
+   * panel beside a 56-point rail is two thirds of the width — so opening on one
+   * puts a wall of chrome over the thing the app exists to show, on the visit
+   * where that view has to do the persuading.
+   *
+   * Overriding the preference rather than changing the default, because the
+   * default is shared with the desktop and with the planetarium and is correct
+   * for both. This does mean a panel opened on a phone is not reopened on the
+   * next visit, which is the ordinary way a phone behaves: the rail is one tap
+   * away and the view is what you came back for.
+   */
+  const startClosed = platform.deviceClass === 'phone';
+  const narrow = window.matchMedia('(max-width: 680px)');
+
+  function registerPanel(id, made, region) {
+    panels.set(id, made);
+    region.append(made.root);
+    show(made.root, !startClosed && prefs.get(`panels.${id}`, false));
+    return made;
+  }
+
+  function togglePanel(id, force) {
+    const made = panels.get(id);
+    if (!made) return;
+    const next = force === undefined ? made.root.hidden : force;
+    // Below 680 points the left and right docks overlap, so a second panel
+    // would land on top of the first.
+    if (next && narrow.matches) {
+      for (const [other, o] of panels) {
+        if (other !== id && !o.root.hidden) {
+          show(o.root, false);
+          prefs.set(`panels.${other}`, false);
+        }
+      }
+    }
+    show(made.root, next);
+    prefs.set(`panels.${id}`, next);
+    if (next) made.root.classList.add('is-entering');
+    syncRail();
+  }
+
+  // ---- navigation panel
+
+  const modeControl = segmented({
+    options: CAMERA_MODES,
+    value: 'orbit',
+    onChange: (value) => setCameraMode(value),
+  });
+
+  const navActions = el('div', { class: 'obj-actions' });
+  const quickList = el('div', { class: 'quick-list' });
+
+  const navPanel = registerPanel('navigation', panel({
+    id: 'navigation',
+    title: 'Navigation',
+    collapsed: false,
+    onToggle: (collapsed) => prefs.set('collapsed.navigation', collapsed),
+    body: [
+      el('div', { class: 'section-title', text: 'Camera mode' }),
+      modeControl.root,
+      el('div', { class: 'section' }, [
+        el('div', { class: 'section-title', text: 'Destinations' }),
+        quickList,
+      ]),
+      el('div', { class: 'section' }, [
+        el('div', { class: 'section-title', text: 'Views' }),
+        el('div', { class: 'obj-actions', style: { borderTop: '0', paddingTop: '0', marginTop: '0' } }, [
+          el('button', { type: 'button', class: 'btn', text: 'From Earth', title: 'Stand on Earth and look at the target',
+            onClick: () => hooks.setViewFromEarth(!state.viewFromEarth) }),
+          el('button', { type: 'button', class: 'btn', text: 'Zoom out', title: 'Continuous exponential pull-back',
+            onClick: () => hooks.tour() }),
+          el('button', { type: 'button', class: 'btn', text: 'Earth \u2192 Saturn', title: 'Fly the real-scale cruise',
+            onClick: () => hooks.saturnRun() }),
+        ]),
+      ]),
+    ],
+  }), dockLeft);
+
+  for (const entry of quickTargets) {
+    quickList.append(el('button', {
+      type: 'button',
+      class: 'btn quick',
+      text: entry.name,
+      // Say that clicking one travels rather than merely selecting. It is the
+      // shortest route into the scene and the one most likely to be tried
+      // first, so it should not be a button whose effect you find out by
+      // pressing it.
+      dataset: { key: entry.key, tip: `Fly to ${entry.name}` },
+      onClick: () => hooks.selectTarget(entry.key, { fly: !state.viewFromEarth }),
+    }));
+  }
+
+  // ---- camera panel
+
+  const cam = prefs.get('camera');
+  controls.setFov(cam.fov);
+  controls.flySpeed = cam.flySpeed;
+  controls.orbitSensitivity = cam.orbitSensitivity;
+  controls.lookSensitivity = cam.lookSensitivity;
+  controls.zoomSpeed = cam.zoomSpeed;
+  controls.autoCenter = cam.autoCenter;
+
+  const fovSlider = slider({
+    label: 'Field of view',
+    min: controls.minFov, max: controls.maxFov, step: 0.5, value: controls.fov,
+    format: (v) => `${v.toFixed(1)}\u00b0`,
+    onInput: (v) => { controls.setFov(v); prefs.set('camera.fov', controls.fov); },
+  });
+
+  const speedSlider = slider({
+    label: 'Camera speed',
+    min: 0.05, max: 4, step: 0.05, value: controls.flySpeed,
+    format: (v) => `${v.toFixed(2)}\u00d7`,
+    title: 'How fast W/A/S/D moves you. Scaled by altitude, so it feels the same at every distance.',
+    onInput: (v) => { controls.flySpeed = v; prefs.set('camera.flySpeed', v); },
+  });
+
+  const rotateSlider = slider({
+    label: 'Rotation speed',
+    min: 0.001, max: 0.02, step: 0.0005, value: controls.orbitSensitivity,
+    format: (v) => `${(v * 1000).toFixed(1)}`,
+    title: 'Drag sensitivity when orbiting.',
+    onInput: (v) => { controls.orbitSensitivity = v; prefs.set('camera.orbitSensitivity', v); },
+  });
+
+  const lookSlider = slider({
+    label: 'Look sensitivity',
+    min: 0.001, max: 0.012, step: 0.0002, value: controls.lookSensitivity,
+    format: (v) => `${(v * 1000).toFixed(1)}`,
+    title: 'Drag sensitivity when looking around (right-drag or shift-drag).',
+    onInput: (v) => { controls.lookSensitivity = v; prefs.set('camera.lookSensitivity', v); },
+  });
+
+  const zoomSlider = slider({
+    label: 'Zoom sensitivity',
+    min: 0.0004, max: 0.006, step: 0.0002, value: controls.zoomSpeed,
+    format: (v) => `${(v * 1000).toFixed(1)}`,
+    onInput: (v) => { controls.zoomSpeed = v; prefs.set('camera.zoomSpeed', v); },
+  });
+
+  const autoCenterCheck = check({
+    label: 'Auto-center on target',
+    checked: controls.autoCenter,
+    title: 'Ease the view back onto the target after you look away.',
+    onChange: (v) => { controls.autoCenter = v; prefs.set('camera.autoCenter', v); },
+  });
+
+  registerPanel('camera', panel({
+    id: 'camera',
+    title: 'Camera',
+    body: [
+      fovSlider.root, speedSlider.root, rotateSlider.root, lookSlider.root, zoomSlider.root,
+      autoCenterCheck.root,
+      el('div', { class: 'section' }, [
+        el('div', { class: 'section-title', text: 'Surface' }),
+        el('button', {
+          type: 'button', class: 'btn', text: 'Descend to surface',
+          title: 'Drop to just above the surface of the target and look around',
+          onClick: () => runAction('land'),
+        }),
+      ]),
+    ],
+  }), dockLeft);
+
+  // ---- display panel
+
+  const labelCheck = check({
+    label: 'Object labels',
+    checked: prefs.get('labels'),
+    onChange: (v) => { prefs.set('labels', v); syncDisplay(); },
+  });
+  const densitySlider = slider({
+    label: 'Label density',
+    min: 0, max: 1, step: 0.05, value: prefs.get('labelDensity'),
+    format: (v) => `${Math.round(v * 100)}%`,
+    onInput: (v) => prefs.set('labelDensity', v),
+  });
+  const hudCheck = check({
+    label: 'Bottom readouts',
+    checked: prefs.get('hud'),
+    onChange: (v) => { prefs.set('hud', v); syncDisplay(); },
+  });
+  const reticleCheck = check({
+    label: 'Center reticle',
+    checked: prefs.get('reticle'),
+    onChange: (v) => { prefs.set('reticle', v); syncDisplay(); },
+  });
+  const exposureSlider = slider({
+    label: 'Exposure',
+    min: 0.2, max: 3, step: 0.05, value: state.exposure,
+    onInput: (v) => hooks.setExposure(v),
+  });
+
+  // One checkbox per row of the options table, and the same call used to apply
+  // the saved value at startup. Written this way so a toggle cannot end up
+  // showing one thing while the renderer does another.
+  const viewChecks = new Map();
+  function setViewOption(key, value) {
+    prefs.set(`view.${key}`, value);
+    viewChecks.get(key)?.set(value);
+    hooks.setView?.(key, value);
+  }
+  const viewSections = VIEW_GROUPS.map((group) => el('div', { class: 'section' }, [
+    el('div', { class: 'section-title', text: group.title }),
+    ...group.options.map((option) => {
+      const box = check({
+        label: option.label,
+        title: option.title,
+        checked: prefs.get(`view.${option.key}`, option.default),
+        onChange: (value) => setViewOption(option.key, value),
+      });
+      viewChecks.set(option.key, box);
+      return box.root;
+    }),
+  ]));
+
+  registerPanel('display', panel({
+    id: 'display',
+    title: 'Display',
+    body: [
+      exposureSlider.root,
+      el('div', { class: 'section' }, [
+        el('div', { class: 'section-title', text: 'Interface' }),
+        labelCheck.root, densitySlider.root, hudCheck.root, reticleCheck.root,
+      ]),
+      ...viewSections,
+    ],
+  }), dockLeft);
+
+  // ---- performance panel
+
+  const quality = createQualityPanel({ prefs, hooks });
+  registerPanel('quality', quality.panel, dockLeft);
+
+  // ---- inspector
+
+  const inspector = createInspector({ onAction: (action) => runAction(action) });
+  const inspectorPanel = registerPanel('inspector', panel({
+    id: 'inspector',
+    title: 'Object',
+    body: [inspector.root],
+  }), regionRight);
+
+  // ---- system panel: the satellites of whatever system you are in
+
+  const systemTree = el('div', { class: 'system-tree' });
+  registerPanel('system', panel({
+    id: 'system',
+    title: 'Planetary system',
+    body: [systemTree],
+  }), regionRight);
+
+  // ---- bookmarks
+
+  const bookmarkList = el('div', { class: 'bookmark-list' });
+  registerPanel('bookmarks', panel({
+    id: 'bookmarks',
+    title: 'Bookmarks',
+    body: [
+      bookmarkList,
+      el('button', {
+        type: 'button', class: 'btn', text: 'Bookmark current target',
+        onClick: () => runAction('bookmark'),
+      }),
+    ],
+  }), regionRight);
+
+  // ------------------------------------------------------------------- top bar
+
+  const railToggle = el('button', {
+    type: 'button',
+    class: 'btn is-icon is-quiet',
+    'aria-label': 'Expand navigation',
+    text: '\u2630',
+    onClick: () => {
+      const open = prefs.get('rail') !== 'labels';
+      prefs.set('rail', open ? 'labels' : 'icons');
+      syncRail();
+    },
+  });
+  railToggle.dataset.tip = 'Expand the navigation rail';
+
+  const timeBar = createTimeBar({
+    getRate: () => state.timeRate,
+    setRate: (rate) => { state.timeRate = rate; },
+    getPlaying: () => state.playing,
+    setPlaying: (playing) => { state.playing = playing; },
+    getDate: () => state.date,
+    setDate: (date) => hooks.setDate(date),
+    onCustom: () => openCustomRate(),
+  });
+
+  append(regionTop, [
+    el('div', { class: 'topbar' }, [
+      railToggle,
+      el('div', { class: 'brand' }, [
+        el('span', { class: 'brand-name', text: 'STILL HERE' }),
+        el('span', { class: 'brand-sub', text: 'explore freely' }),
+      ]),
+      search.root,
+      el('div', { class: 'topbar-spacer' }),
+      timeBar.root,
+    ]),
+  ]);
+
+  // -------------------------------------------------------------------- bottom
+
+  const hud = createHud();
+  const scaleBar = createScaleBar();
+  regionCenter.append(scaleBar.root);
+
+  const bottomRight = el('div', { class: 'bottom-right' }, [
+    el('button', {
+      type: 'button', class: 'btn', text: 'Immersive',
+      title: TOUCH
+        ? 'Hide the entire interface \u2014 tap the line at the bottom to bring it back'
+        : 'Hide the entire interface',
+      onClick: () => setImmersive(true),
+    }),
+    el('button', {
+      type: 'button', class: 'btn is-icon', text: '?',
+      'aria-label': 'Help',
+      onClick: () => toggleDialog('help'),
+    }),
+  ]);
+  // Between the readouts and the buttons, so switching to a flight mode makes
+  // the controls appear next to the speed and altitude they change.
+  const flight = createFlightControls({ controls, prefs });
+  append(regionBottom, [hud.root, flight.root, bottomRight]);
+
+  /*
+   * Immersive mode fades the whole interface out, and on a desktop F11 brings it
+   * back. On a touch device that is a one-way door: there are no F keys, and
+   * everything that could have restored the interface has just been faded out
+   * and told to ignore the pointer.
+   *
+   * So on touch the hint stops being a note about the way out and becomes the
+   * way out. It is the only element in the mode that keeps its pointer events,
+   * it settles to a quarter opacity instead of vanishing — see the rule in
+   * theme.css — and it is sized as something to press rather than as a caption.
+   */
+  const immersiveHint = el('div', {
+    class: TOUCH ? 'immersive-hint is-touch' : 'immersive-hint',
+    text: TOUCH
+      ? 'immersive mode \u2014 tap here to bring the interface back'
+      : 'immersive mode \u2014 press F11 to bring the interface back',
+  });
+  if (TOUCH) {
+    immersiveHint.addEventListener('click', () => setImmersive(false));
+  }
+  document.body.append(immersiveHint);
+
+  const intro = createIntro({
+    prefs,
+    // Earth rather than anywhere more spectacular: the point of the button is to
+    // demonstrate that clicking a name travels somewhere, and the destination
+    // list is right there to be tried next.
+    onStart: () => hooks.selectTarget('earth', { fly: true }),
+    onGuide: () => toggleDialog('help', true),
+  });
+  document.body.append(intro.root);
+
+  // --------------------------------------------------------------------- rail
+
+  const RAIL = [
+    { id: 'search', label: 'Search', icon: 'search', action: 'search' },
+    { id: 'navigation', label: 'Navigation', icon: 'compass', action: 'panel' },
+    { id: 'camera', label: 'Camera', icon: 'camera', action: 'panel' },
+    { id: 'inspector', label: 'Object', icon: 'planet', action: 'panel' },
+    // `short` is what the rail shows when it is open; `label` is what the
+    // tooltip says and what the panel is called. Only one entry needs the
+    // distinction, and it needs it because the rail is now open by default and
+    // "Planetary system" is wider than the rail is worth.
+    { id: 'system', label: 'Planetary system', short: 'System', icon: 'system', action: 'panel' },
+    'sep',
+    { id: 'catalog', label: 'Catalog', icon: 'catalog', action: 'dialog' },
+    { id: 'bookmarks', label: 'Bookmarks', icon: 'bookmark', action: 'panel' },
+    'sep',
+    { id: 'display', label: 'Display', icon: 'eye', action: 'panel' },
+    { id: 'quality', label: 'Performance', icon: 'gauge', action: 'panel' },
+    { id: 'settings', label: 'Settings', icon: 'settings', action: 'dialog' },
+    { id: 'help', label: 'Help', icon: 'help', action: 'dialog' },
+  ];
+
+  const railItems = new Map();
+  const rail = el('div', { class: 'rail panel takes-pointer' }, RAIL.map((entry) => {
+    if (entry === 'sep') return el('div', { class: 'rail-sep' });
+    const button = el('button', {
+      type: 'button',
+      class: 'rail-item',
+      onClick: () => {
+        if (entry.action === 'search') search.focus();
+        else if (entry.action === 'panel') togglePanel(entry.id);
+        else toggleDialog(entry.id);
+      },
+    }, [icon(entry.icon), el('span', { class: 'rail-label', text: entry.short ?? entry.label })]);
+    button.dataset.tip = entry.label;
+    railItems.set(entry.id, button);
+    return button;
+  }));
+  regionLeft.append(rail, dockLeft);
+
+  function syncRail() {
+    css(rail, 'is-open', prefs.get('rail') === 'labels');
+    for (const [id, button] of railItems) {
+      const made = panels.get(id);
+      if (made) css(button, 'is-active', !made.root.hidden);
+      else css(button, 'is-active', dialogs.get(id) ? !dialogs.get(id).root.hidden : false);
+      // Tooltips carry the shortcut where there is one, so the keys are
+      // discoverable without opening the help panel.
+      const binding = shortcuts.binding(`open.${id}`);
+      if (binding) button.dataset.tipKey = prettyChord(binding);
+    }
+  }
+
+  // ------------------------------------------------------------------ dialogs
+
+  const dialogs = new Map();
+
+  function registerDialog(id, made) {
+    dialogs.set(id, made);
+    document.body.append(made.root);
+    show(made.root, false);
+    return made;
+  }
+
+  function toggleDialog(id, force) {
+    const made = dialogs.get(id);
+    if (!made) return;
+    const next = force === undefined ? made.root.hidden : force;
+    // Only one dialog at a time; two overlapping translucent dialogs over a
+    // starfield are illegible.
+    for (const [otherId, other] of dialogs) if (otherId !== id) show(other.root, false);
+    show(made.root, next);
+    if (id === 'catalog' && next) buildCatalog();
+    syncRail();
+  }
+
+  // ---- help / shortcuts
+
+  const helpKeys = el('div', { class: 'help-keys' });
+  registerDialog('help', dialog({
+    title: 'Cosminova \u2014 how to get around',
+    placement: 'center',
+    onClose: () => toggleDialog('help', false),
+    body: [
+      el('div', { class: 'help-grid' }, [
+        el('div', {}, [
+          /*
+           * This dialog used to open on "Pointer" and a list of gestures. That
+           * tells someone who already knows what they are trying to do which
+           * button to hold; it does not tell someone who has just arrived in
+           * front of a black screen full of stars what to do first. So the
+           * first thing in it is now the shortest path to somewhere worth
+           * being, and the gestures follow.
+           */
+          el('div', { class: 'section-title', text: 'Getting somewhere' }),
+          el('p', { class: 'prose', html:
+            `Open the <b>Catalog</b>${TOUCH ? '' : ' (<b>C</b>)'} to browse by kind \u2014 star systems, exoplanets, black holes, `
+            + 'neutron stars, nebulae, star clusters, galaxies \u2014 and pick one to fly to it. '
+            + 'Or type a name into the search box at the top \u2014 any of five thousand stars, '
+            + 'the named moons, a few thousand galaxies, or a planet around another sun. '
+            + 'Everything in the scene is somewhere you can actually go.' }),
+          el('p', { class: 'prose', html: TOUCH
+            ? 'Once you are there: <b>drag</b> to swing around it, <b>pinch</b> to close in or pull back, '
+              + 'and <b>Land</b> in the Object panel to drop to the surface and walk on it.'
+            : 'Once you are there: <b>drag</b> to swing around it, <b>scroll</b> to close in or pull back, '
+              + 'and <b>Land</b> in the Object panel (or <b>L</b>) to drop to the surface and walk on it.' }),
+
+          el('div', { class: 'section-title', text: 'On foot' }),
+          el('p', { class: 'prose', html: TOUCH
+            ? 'After landing you are standing at eye height. The <b>flight pad</b> walks you over the ground, '
+              + 'drag looks around, and pinch sets your pace. Pick another camera mode to take off again.'
+            : 'After landing you are standing at eye height in <b>Walk</b> mode. <b>W A S D</b> walk, '
+              + '<b>Shift</b> runs, and holding a key builds speed. <b>[</b> and <b>]</b> set your pace, '
+              + 'drag looks around, and the wheel raises and lowers your eye. Scroll out far enough and you '
+              + 'take off back into the sky; scroll all the way into the ground from orbit and you land. '
+              + 'In <b>Fly</b> and <b>Roam</b>, <b>[</b> and <b>]</b> set the speed too, and holding <b>W</b> keeps accelerating.' }),
+
+          el('div', { class: 'section-title', text: 'The other camera modes' }),
+          el('p', { class: 'prose', html:
+            '<b>Orbit</b> circles whatever is selected \u2014 the mode you arrive in. '
+            + (TOUCH
+              ? '<b>Fly</b> adds thrust on the <b>flight pad</b> that appears below, still measured from that body. '
+              : '<b>Fly</b> adds thrust on <b>W A S D</b>, still measured from that body. ')
+            + '<b>Track</b> is the same but keeps the body centred while you move. '
+            + '<b>Roam</b> lets go of it completely: no target, no orbit, just open space. '
+            + (TOUCH
+              ? 'Drag turns you on the spot, pinch sets your speed, and how fast you go '
+              : 'Drag turns you on the spot, the wheel sets your speed, and how fast you go ')
+            + 'scales with whatever happens to be nearest \u2014 so you slow to a crawl on '
+            + 'the way in to something and cross the system when nothing is close.' }),
+
+          /*
+           * The gesture list, in the words of whatever is holding the app. The
+           * touch version is not a translation of the pointer one: two of the
+           * five gestures below have no counterpart on a mouse at all, and two
+           * of the mouse's — the right button and the wheel — have no finger.
+           * A list that named both would be twice as long and half of it would
+           * be unusable on the device reading it.
+           */
+          el('div', { class: 'section-title', text: TOUCH ? 'Touch' : 'Pointer and keys' }),
+          el('p', { class: 'prose', html: TOUCH
+            ? '<b>Drag</b> orbits the target. <b>Two fingers</b> dragged together look around instead. '
+              + '<b>Pinch</b> zooms exponentially and keeps coasting, from metres above a crater out past the Local Group. '
+              + '<b>Tap</b> selects and travels, <b>double tap</b> closes in further, and <b>press and hold</b> opens the object menu. '
+              + 'The <b>flight pad</b> at the bottom of the screen thrusts, climbs and dives, and <b>Boost</b> beside it flies four times and walks ten times faster.'
+            : '<b>Drag</b> orbits the target. <b>Right-drag</b> or <b>shift-drag</b> looks around. '
+              + '<b>Scroll</b> zooms exponentially and keeps coasting, from metres above a crater out past the Local Group. '
+              + '<b>Click</b> selects and travels; <b>right-click</b> opens the object menu. '
+              + '<b>W A S D</b> with <b>Q</b>/<b>E</b> flies and <b>shift</b> boosts. On foot, holding a key speeds up to sixty times walking pace. '
+              + 'Hover any control to be told what it does.' }),
+          el('div', { class: 'section-title', text: 'What you are looking at' }),
+          el('p', { class: 'prose', text:
+            'One continuous scene at true scale. Surfaces are spacecraft imagery where it exists \u2014 LROC and LOLA for '
+            + 'the Moon, Voyager and Galileo for the Jovian moons, Cassini for Titan \u2014 and procedural relief below '
+            + 'that. Named moons, nearby stars with confirmed planets and a few thousand galaxies sit at their measured '
+            + 'distances.' }),
+          el('p', { class: 'prose is-credits', text:
+            'Imagery: NASA/GSFC/Arizona State University (LROC, LOLA), NASA/JPL/USGS, Solar System Scope (CC BY 4.0). '
+            + 'Stars: HYG v4.1. Galaxies: UNGC, Cosmicflows-3, RC3. Exoplanets: NASA Exoplanet Archive. Milky Way '
+            + 'panorama: ESO/S. Brunier.' }),
+        ]),
+        el('div', {}, [
+          /*
+           * Kept on touch rather than dropped, and retitled instead. An iPad
+           * with a keyboard attached is a common way to use this, and so is an
+           * iPhone with one; what would be wrong is presenting the table as
+           * the way in when for most touch users there is nothing to press.
+           */
+          el('div', { class: 'section-title', text: TOUCH
+            ? 'With a keyboard attached \u2014 tap a key to rebind'
+            : 'Keyboard \u2014 click a key to rebind' }),
+          TOUCH && el('p', { class: 'prose', html:
+            'Nothing in this table is the only way in \u2014 every panel and dialog also has an '
+            + 'icon on the <b>rail</b> down the left edge. Rows reading <b>unset</b> are ones '
+            + 'that have no key on this device; tap one to give it whichever you prefer.' }),
+          helpKeys,
+          el('div', { class: 'section' }, [
+            el('button', {
+              type: 'button',
+              class: 'btn',
+              text: 'Show the welcome card again',
+              dataset: { tip: 'The three-step card from your first visit' },
+              onClick: () => {
+                toggleDialog('help', false);
+                intro.show();
+              },
+            }),
+          ]),
+        ]),
+      ]),
+    ],
+  }));
+
+  // ---- settings
+
+  const scaleSlider = slider({
+    label: 'Interface scale',
+    min: 0.8, max: 1.6, step: 0.05, value: prefs.get('scale'),
+    format: (v) => `${Math.round(v * 100)}%`,
+    onInput: (v) => prefs.set('scale', v),
+  });
+  const alphaSlider = slider({
+    label: 'Panel opacity',
+    min: 0.3, max: 1, step: 0.02, value: prefs.get('alpha'),
+    format: (v) => `${Math.round(v * 100)}%`,
+    onInput: (v) => prefs.set('alpha', v),
+  });
+  const accentSlider = slider({
+    label: 'Accent colour',
+    min: 0, max: 360, step: 1, value: prefs.get('accent'),
+    format: (v) => `${v}\u00b0`,
+    onInput: (v) => prefs.set('accent', v),
+  });
+
+  registerDialog('settings', dialog({
+    title: 'Interface',
+    placement: 'right',
+    onClose: () => toggleDialog('settings', false),
+    body: [
+      scaleSlider.root, alphaSlider.root, accentSlider.root,
+      el('p', { class: 'prose', text: 'Panel visibility, camera sensitivities and these appearance settings are saved between sessions.' }),
+      el('div', { class: 'section' }, [
+        el('button', {
+          type: 'button', class: 'btn', text: 'Reset interface to defaults',
+          onClick: () => {
+            prefs.reset();
+            scaleSlider.set(prefs.get('scale'));
+            alphaSlider.set(prefs.get('alpha'));
+            accentSlider.set(prefs.get('accent'));
+            for (const [id, made] of panels) show(made.root, prefs.get(`panels.${id}`, false));
+            syncRail();
+            syncDisplay();
+            buildHelpKeys();
+          },
+        }),
+      ]),
+    ],
+  }));
+
+  // ---- catalog
+
+  const catalogBody = el('div', { class: 'catalog' });
+  registerDialog('catalog', dialog({
+    title: 'Catalog',
+    placement: 'center',
+    onClose: () => toggleDialog('catalog', false),
+    body: [catalogBody],
+  }));
+
+  // Browsed by what a thing is rather than by what it belongs to: grouping by
+  // host put every one of four thousand exoplanet systems in a section of its
+  // own, and a black hole or a nebula was a needle in that.
+  const bySubtype = (labels) => Object.entries(labels).map(([id, label]) => ({ id, label, test: (d) => d.subtype === id }));
+  const CATALOG_TABS = [
+    { id: 'solar', label: 'Solar system', test: (d) => d.key === 'sun' || d.kind === 'body' || d.kind === 'moon', sections: true },
+    {
+      id: 'systems', label: 'Star systems', test: (d) => d.kind === 'star' && d.key !== 'sun',
+      chips: [
+        { id: 'planets', label: 'With planets', test: (d) => d.system?.planets?.length > 0 },
+        { id: 'bright', label: 'Bright stars', test: (d) => d.mag != null },
+        { id: 'invented', label: 'In other galaxies', test: (d) => Boolean(d.system?.generated || d.generated) },
+      ],
+    },
+    { id: 'exoplanets', label: 'Exoplanets', test: (d) => d.kind === 'exo-planet' },
+    { id: 'holes', label: 'Black holes', test: (d) => d.kind === 'black-hole' },
+    { id: 'neutron', label: 'Neutron stars', test: (d) => d.kind === 'neutron-star', chips: bySubtype(NEUTRON_LABELS) },
+    { id: 'nebulae', label: 'Nebulae', test: (d) => d.kind === 'nebula', chips: bySubtype(NEBULA_LABELS) },
+    { id: 'clusters', label: 'Star clusters', test: (d) => d.kind === 'cluster', chips: bySubtype(CLUSTER_LABELS) },
+    { id: 'galaxies', label: 'Galaxies', test: (d) => d.kind === 'galaxy' },
+    { id: 'craft', label: 'Spacecraft', test: (d) => d.kind === 'craft' },
+  ];
+  const catalogState = { tab: 'nebulae', chip: null, filter: '', limit: 120 };
+
+  function lightYears(dest) {
+    const ly = dest.distMpc != null ? dest.distMpc * 3.26156e6 : dest.distPc != null ? dest.distPc * 3.26156 : null;
+    if (ly == null) return '';
+    if (ly >= 1e6) return `${(ly / 1e6).toLocaleString(undefined, { maximumFractionDigits: 1 })} million ly`;
+    return `${ly.toLocaleString(undefined, { maximumFractionDigits: ly < 100 ? 1 : 0 })} ly`;
+  }
+
+  function buildCatalog() {
+    const tab = CATALOG_TABS.find((t) => t.id === catalogState.tab) ?? CATALOG_TABS[0];
+    const counts = new Map(CATALOG_TABS.map((t) => [t.id, 0]));
+    for (const dest of destinations) {
+      for (const t of CATALOG_TABS) if (t.test(dest)) counts.set(t.id, counts.get(t.id) + 1);
+    }
+    const chip = tab.chips?.find((c) => c.id === catalogState.chip) ?? null;
+    const query = catalogState.filter.trim().toLowerCase();
+    const entries = destinations
+      .filter((d) => tab.test(d) && (!chip || chip.test(d)) && (!query || d.name.toLowerCase().includes(query)))
+      .sort((a, b) => (a.distMpc ?? a.distPc ?? Infinity) - (b.distMpc ?? b.distPc ?? Infinity) || a.name.localeCompare(b.name));
+
+    const go = (dest) => { toggleDialog('catalog', false); hooks.selectTarget(dest.key, { fly: true }); };
+    const row = (dest) => el('button', { type: 'button', class: 'catalog-row', onClick: () => go(dest) }, [
+      el('span', { class: 'catalog-name', text: dest.name }),
+      el('span', { class: 'catalog-meta', text: [dest.detail ?? (tab.sections ? null : dest.group), lightYears(dest)].filter(Boolean).join(' \u00b7 ') }),
+    ]);
+    const shown = entries.slice(0, catalogState.limit);
+    let list;
+    if (tab.sections && !query) {
+      const groups = new Map();
+      for (const dest of shown) {
+        if (!groups.has(dest.group)) groups.set(dest.group, []);
+        groups.get(dest.group).push(dest);
+      }
+      list = [...groups.entries()].map(([group, items]) => el('div', { class: 'section' }, [
+        el('div', { class: 'section-title', text: group }),
+        el('div', { class: 'catalog-list' }, items.map(row)),
+      ]));
+    } else {
+      list = el('div', { class: 'catalog-list' }, shown.map(row));
+    }
+
+    const rebuild = (patch) => { Object.assign(catalogState, patch); catalogBody.__sig = null; buildCatalog(); };
+    const filterInput = el('input', {
+      type: 'search', class: 'input catalog-filter', placeholder: `Filter ${tab.label.toLowerCase()}`, value: catalogState.filter,
+      onInput: (event) => {
+        catalogState.filter = event.target.value;
+        catalogState.limit = 120;
+        clearTimeout(filterInput.__timer);
+        filterInput.__timer = setTimeout(() => {
+          rebuild({});
+          const next = catalogBody.querySelector('.catalog-filter');
+          next?.focus();
+          next?.setSelectionRange(next.value.length, next.value.length);
+        }, 140);
+      },
+    });
+    const signature = [tab.id, chip?.id, query, catalogState.limit, entries.length, destinations.length].join('|');
+    reconcile(catalogBody, signature, () => [
+      el('nav', { class: 'catalog-tabs' }, CATALOG_TABS.map((t) => el('button', {
+        type: 'button',
+        class: `catalog-tab${t.id === tab.id ? ' is-active' : ''}`,
+        onClick: () => rebuild({ tab: t.id, chip: null, filter: '', limit: 120 }),
+      }, [el('span', { text: t.label }), el('span', { class: 'catalog-count', text: counts.get(t.id).toLocaleString() })]))),
+      el('div', { class: 'catalog-main' }, [
+        filterInput,
+        tab.chips ? el('div', { class: 'catalog-chips' }, [
+          el('button', { type: 'button', class: `catalog-chip${chip ? '' : ' is-active'}`, text: 'All', onClick: () => rebuild({ chip: null, limit: 120 }) }),
+          ...tab.chips.map((c) => el('button', {
+            type: 'button', class: `catalog-chip${chip?.id === c.id ? ' is-active' : ''}`, text: c.label,
+            onClick: () => rebuild({ chip: c.id, limit: 120 }),
+          })),
+        ]) : null,
+        el('div', { class: 'catalog-results' }, [
+          entries.length ? list : el('div', { class: 'catalog-empty', text: 'Nothing matches.' }),
+          entries.length > shown.length
+            ? el('button', {
+              type: 'button', class: 'btn catalog-more',
+              text: `Show more (${(entries.length - shown.length).toLocaleString()} left)`,
+              onClick: () => rebuild({ limit: catalogState.limit + 240 }),
+            })
+            : null,
+        ]),
+      ]),
+    ]);
+  }
+
+  // ------------------------------------------------------------------- actions
+
+  /** The verbs shared by the inspector, the context menu and search. */
+  function runAction(action, key = state.target) {
+    const resolved = resolveWorld(key);
+    switch (action) {
+      case 'goto':
+        hooks.selectTarget(key, { fly: true });
+        break;
+      case 'center':
+      case 'target':
+        hooks.selectTarget(key, { fly: false });
+        break;
+      case 'orbit':
+        hooks.selectTarget(key, { fly: false });
+        setCameraMode('orbit');
+        break;
+      case 'track':
+        hooks.selectTarget(key, { fly: false });
+        setCameraMode('track');
+        break;
+      case 'land':
+        hooks.selectTarget(key, { fly: false });
+        controls.descendToSurface();
+        // Straight onto your feet: the landing is where walking starts.
+        if (resolved?.kind === 'body') setCameraMode('walk');
+        break;
+      case 'onboard':
+        hooks.viewFromCraft?.(key);
+        break;
+      case 'info':
+        hooks.selectTarget(key, { fly: false });
+        togglePanel('inspector', true);
+        break;
+      case 'bookmark':
+        addBookmark(key, resolved?.name ?? key);
+        break;
+      case 'parent': {
+        const parent = resolved?.spec?.parent;
+        if (parent) hooks.selectTarget(parent, { fly: true });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  function setCameraMode(mode) {
+    if (mode !== 'ship') hooks.setShip?.(false);
+    // Leaving roam has to hand the target back before anything else reads the
+    // distance, since roaming leaves the camera somewhere no bearing describes.
+    if (mode !== 'roam' && mode !== 'ship') controls.stopRoam();
+    if (mode !== 'walk') controls.stopWalk();
+    if (mode === 'walk') {
+      controls.trackTarget = false;
+      if (resolveWorld(state.target)?.kind !== 'body') return;
+      controls.startWalk();
+    } else if (mode === 'orbit') {
+      controls.mode = 'orbit';
+      controls.trackTarget = false;
+    } else if (mode === 'free') {
+      controls.mode = 'fly';
+      controls.trackTarget = false;
+    } else if (mode === 'track') {
+      controls.mode = 'fly';
+      controls.trackTarget = true;
+    } else if (mode === 'roam') {
+      controls.trackTarget = false;
+      controls.startRoam();
+    } else if (mode === 'ship') {
+      hooks.setShip?.(true);
+    }
+    modeControl.set(mode);
+    // Orbit has nothing for thrust to do, so the pad only exists in the modes
+    // where pressing a key moves you.
+    flight.setVisible(mode !== 'orbit');
+    flight.setRoaming(mode === 'roam' || mode === 'ship');
+    flight.setWalking(mode === 'walk');
+  }
+
+  function currentMode() {
+    if (controls.pilot && controls.mode === 'roam') return 'ship';
+    if (controls.mode === 'roam') return 'roam';
+    if (controls.mode === 'walk') return 'walk';
+    if (state.viewFromEarth) return 'orbit';
+    if (controls.mode === 'fly') return controls.trackTarget ? 'track' : 'free';
+    return 'orbit';
+  }
+
+  // ----------------------------------------------------------------- bookmarks
+
+  function addBookmark(key, name) {
+    const list = prefs.get('bookmarks', []).slice();
+    if (list.some((b) => b.key === key)) return;
+    list.push({ key, name });
+    prefs.set('bookmarks', list);
+    buildBookmarks();
+    togglePanel('bookmarks', true);
+  }
+
+  function removeBookmark(key) {
+    prefs.set('bookmarks', prefs.get('bookmarks', []).filter((b) => b.key !== key));
+    buildBookmarks();
+  }
+
+  function buildBookmarks() {
+    const list = prefs.get('bookmarks', []);
+    reconcile(bookmarkList, list.map((b) => b.key).join('|') || 'empty', () =>
+      list.length
+        ? list.map((b) => el('div', { class: 'bookmark-row' }, [
+            el('button', {
+              type: 'button', class: 'btn is-quiet bookmark-go', text: b.name,
+              onClick: () => hooks.selectTarget(b.key, { fly: true }),
+            }),
+            el('button', {
+              type: 'button', class: 'btn is-icon is-quiet', text: '\u00d7',
+              'aria-label': `Remove ${b.name}`,
+              onClick: () => removeBookmark(b.key),
+            }),
+          ]))
+        : [el('p', { class: 'obj-empty', text: 'No bookmarks yet. Bookmark an object from its menu or from search.' })],
+    );
+  }
+
+  // -------------------------------------------------------------- context menu
+
+  function openObjectMenu(x, y, key) {
+    const resolved = resolveWorld(key);
+    if (!resolved) return;
+    const described = describeFor(key, resolved);
+    const spec = resolved.spec;
+    const parentKey = spec?.parent && spec.parent !== 'sun' ? spec.parent : null;
+    const satellites = hooks.satellitesOf(key);
+
+    menu.open({
+      x, y,
+      title: resolved.name,
+      subtitle: described?.className,
+      items: [
+        { label: 'Go to', run: () => runAction('goto', key), shortcut: prettyChord(shortcuts.binding('nav.goto')) },
+        { label: 'Orbit', run: () => runAction('orbit', key) },
+        { label: 'Track', run: () => runAction('track', key) },
+        { label: 'Land', run: () => runAction('land', key), disabled: resolved.kind !== 'body' },
+        '-',
+        { label: 'View information', run: () => runAction('info', key) },
+        { label: 'Set as target', run: () => runAction('target', key) },
+        { label: 'Add bookmark', run: () => runAction('bookmark', key) },
+        '-',
+        { label: 'Find parent', run: () => runAction('parent', key), disabled: !parentKey },
+        {
+          label: satellites.length ? `Find moons (${satellites.length})` : 'Find moons',
+          disabled: !satellites.length,
+          // Opens a second menu in place rather than a hover submenu, which is
+          // fiddly to hit and needs its own timing logic.
+          run: () => menu.open({
+            x, y,
+            title: `${resolved.name} \u00b7 satellites`,
+            items: satellites.slice(0, 24).map((moon) => ({
+              label: moon.name,
+              run: () => hooks.selectTarget(moon.key, { fly: true }),
+            })),
+          }),
+        },
+      ],
+    });
+  }
+
+  // ------------------------------------------------------------------ system
+
+  function buildSystemTree(resolved) {
+    if (!resolved) return;
+    const spec = resolved.spec;
+    // The system shown is the one you are in: the primary of a moon, or the body
+    // itself when it has satellites of its own. A planet of another star names
+    // its host the same way a moon names its planet, so arriving at one of those
+    // shows the star and its siblings without this needing to know the
+    // difference.
+    const rootKey = spec?.parent && spec.parent !== 'sun' ? spec.parent : resolved.key;
+    const rootResolved = resolveWorld(rootKey);
+    const satellites = hooks.satellitesOf(rootKey);
+    const signature = `${rootKey}|${state.target}|${satellites.length}`;
+
+    reconcile(systemTree, signature, () => {
+      if (!rootResolved) return [el('p', { class: 'obj-empty', text: 'No system here.' })];
+      const rows = [el('button', {
+        type: 'button',
+        class: `btn is-quiet tree-root${state.target === rootKey ? ' is-active' : ''}`,
+        text: rootResolved.name,
+        onClick: () => hooks.selectTarget(rootKey, { fly: true }),
+      })];
+      if (!satellites.length) {
+        // Worded for what is being looked at. "No known satellites" is right at
+        // Mercury and wrong at a star, where the question was what orbits it.
+        const empty = rootResolved.kind === 'star' || rootResolved.kind === 'black-hole'
+          ? 'Nothing known in orbit.'
+          : 'No known satellites.';
+        rows.push(el('p', { class: 'obj-empty', text: empty }));
+        return rows;
+      }
+      rows.push(el('div', { class: 'tree-kids' }, satellites.slice(0, 40).map((moon) =>
+        el('button', {
+          type: 'button',
+          class: `btn is-quiet tree-kid${state.target === moon.key ? ' is-active' : ''}`,
+          onClick: () => hooks.selectTarget(moon.key, { fly: true }),
+        }, [
+          el('span', { class: 'tree-name', text: moon.name }),
+          // A radius is the useful number for a moon and a useless one for a
+          // star, so a row is allowed to bring its own: how far out it orbits,
+          // or how many planets it has. See membersOf in space.js.
+          el('span', { class: 'tree-size', text: moon.note ?? `${Math.round(moon.radiusKm)} km` }),
+        ]))));
+      return rows;
+    });
+  }
+
+  // ------------------------------------------------------------------ display
+
+  const labelLayer = createLabelLayer(labelRoot);
+
+  function syncDisplay() {
+    show(hud.root, prefs.get('hud'));
+    css(reticle, 'is-hidden', !prefs.get('reticle'));
+    reticle.style.display = prefs.get('reticle') ? '' : 'none';
+    labelRoot.style.display = prefs.get('labels') ? '' : 'none';
+    if (!prefs.get('labels')) labelLayer.clear();
+  }
+
+  // ---------------------------------------------------------------- immersive
+
+  /**
+   * @param {boolean} on
+   * @param {boolean} [instant] skip the fade. Capture scripts need the interface
+   *   to be provably gone by the time they take the shot, and a transition only
+   *   completes if frames are being serviced — which, on a machine slow enough to
+   *   be rendering this scene in software, is not something to rely on.
+   */
+  function setImmersive(on, instant = false) {
+    if (instant) {
+      css(document.body, 'no-ui-anim', true);
+      // Force a style flush so the transition-free rule is in effect before the
+      // state change, rather than being batched with it.
+      void document.body.offsetWidth;
+    }
+    css(document.body, 'immersive', on);
+    /*
+     * A script that hid the interface in order to photograph the scene does not
+     * need to be told how to get the interface back — and it got photographed
+     * instead. The hint lingers five seconds after the interface goes, which is
+     * longer than the first still takes to settle, so the committed hero frame
+     * on the site had "press F11 to bring the interface back" written across the
+     * bottom of it.
+     *
+     * It needs saying here rather than in the stylesheet because the no-ui-anim
+     * rule above cannot reach it: that zeroes transition durations, and this is
+     * a keyframe animation, which has to be called off by name. `instant` is
+     * only ever true for the programmatic route, so this is exactly the set of
+     * callers that should never see it.
+     */
+    css(immersiveHint, 'is-silent', instant);
+    if (instant) {
+      void document.body.offsetWidth;
+      css(document.body, 'no-ui-anim', false);
+    }
+    if (on) {
+      menu.close();
+      search.close();
+      for (const made of dialogs.values()) show(made.root, false);
+    }
+  }
+
+  function isImmersive() {
+    return document.body.classList.contains('immersive');
+  }
+
+  // ---------------------------------------------------------------- shortcuts
+
+  function anyDialogOpen() {
+    for (const made of dialogs.values()) if (!made.root.hidden) return true;
+    return false;
+  }
+
+  shortcuts.register({ id: 'open.help', key: 'F1', label: 'Help and controls', group: 'Interface', run: () => toggleDialog('help') });
+  shortcuts.register({ id: 'open.search', key: 'F2', label: 'Search', group: 'Interface', allowInInput: true, run: () => search.focus() });
+  shortcuts.register({ id: 'open.inspector', key: 'F3', label: 'Object information', group: 'Interface', run: () => togglePanel('inspector') });
+  shortcuts.register({ id: 'open.navigation', key: 'F4', label: 'Navigation panel', group: 'Interface', run: () => togglePanel('navigation') });
+  shortcuts.register({ id: 'toggle.labels', key: 'F5', label: 'Object labels', group: 'Interface', run: () => { prefs.toggle('labels'); labelCheck.set(prefs.get('labels')); syncDisplay(); } });
+  shortcuts.register({ id: 'open.camera', key: 'F6', label: 'Camera panel', group: 'Interface', run: () => togglePanel('camera') });
+  shortcuts.register({ id: 'open.system', key: 'F7', label: 'Planetary system', group: 'Interface', run: () => togglePanel('system') });
+  shortcuts.register({ id: 'open.bookmarks', key: 'F8', label: 'Bookmarks', group: 'Interface', run: () => togglePanel('bookmarks') });
+  shortcuts.register({ id: 'open.catalog', key: 'C', label: 'Catalog: browse by kind of object', group: 'Interface', run: () => toggleDialog('catalog') });
+  shortcuts.register({ id: 'open.display', key: 'F9', label: 'Display panel', group: 'Interface', run: () => togglePanel('display') });
+  shortcuts.register({ id: 'open.settings', key: 'F10', label: 'Interface settings', group: 'Interface', run: () => toggleDialog('settings') });
+  shortcuts.register({ id: 'toggle.immersive', key: 'F11', label: 'Immersive mode', group: 'Interface', allowInInput: true, run: () => setImmersive(!isImmersive()) });
+  // Music had only the checkbox in the Display panel, which is behind F9 — so
+  // on a Mac, where F9 is a volume key unless the user has been told
+  // otherwise, the way to turn the music off was unreachable by keyboard. It
+  // goes through setViewOption rather than straight to the hook so the
+  // checkbox and the saved preference follow.
+  shortcuts.register({ id: 'toggle.music', key: 'F12', label: 'Music', group: 'Interface', run: () => setViewOption('music', !prefs.get('view.music', true)) });
+  shortcuts.register({ id: 'toggle.hud', key: 'H', label: 'Bottom readouts', group: 'Interface', run: () => { prefs.toggle('hud'); hudCheck.set(prefs.get('hud')); syncDisplay(); } });
+
+  shortcuts.register({ id: 'time.pause', key: 'Space', label: 'Pause or resume time', group: 'Simulation', run: () => { state.playing = !state.playing; timeBar.sync(); } });
+  shortcuts.register({ id: 'time.faster', key: '.', label: 'Faster', group: 'Simulation', run: () => timeBar.setRateAndPlay(nextRate(1)) });
+  shortcuts.register({ id: 'time.slower', key: ',', label: 'Slower or reverse', group: 'Simulation', run: () => timeBar.setRateAndPlay(nextRate(-1)) });
+  shortcuts.register({ id: 'time.now', key: 'N', label: 'Jump to the present', group: 'Simulation', run: () => { hooks.setDate(new Date()); timeBar.setRateAndPlay(1); } });
+
+  shortcuts.register({ id: 'nav.goto', key: 'G', label: 'Travel to the selection', group: 'Navigation', run: () => runAction('goto') });
+  shortcuts.register({ id: 'nav.orbit', key: 'O', label: 'Orbit the selection', group: 'Navigation', run: () => runAction('orbit') });
+  shortcuts.register({ id: 'nav.track', key: 'T', label: 'Track the selection', group: 'Navigation', run: () => setCameraMode(currentMode() === 'track' ? 'free' : 'track') });
+  shortcuts.register({ id: 'nav.roam', key: 'R', label: 'Roam free of any target', group: 'Navigation', run: () => setCameraMode(currentMode() === 'roam' ? 'orbit' : 'roam') });
+  shortcuts.register({ id: 'ship.toggle', key: 'P', label: 'Take or leave the ship', group: 'Ship', run: () => setCameraMode(currentMode() === 'ship' ? 'orbit' : 'ship') });
+  shortcuts.register({ id: 'ship.view', key: 'V', label: 'Chase or cockpit view', group: 'Ship', when: () => hooks.shipActive?.(), run: () => hooks.toggleShipView?.() });
+  shortcuts.register({ id: 'ship.brake', key: 'X', label: 'Full stop', group: 'Ship', when: () => hooks.shipActive?.(), run: () => hooks.shipBrake?.() });
+  shortcuts.register({ id: 'ship.warp', key: 'J', label: 'Engage or drop warp', group: 'Ship', when: () => hooks.shipActive?.(), run: () => hooks.toggleWarp?.() });
+  shortcuts.register({ id: 'nav.land', key: 'L', label: 'Descend to the surface', group: 'Navigation', run: () => runAction('land') });
+  shortcuts.register({ id: 'nav.bookmark', key: 'B', label: 'Bookmark the selection', group: 'Navigation', run: () => runAction('bookmark') });
+
+  // Esc unwinds one layer at a time, topmost first, so it is always the way back
+  // out of whatever is in front of you rather than a blunt close-everything.
+  shortcuts.register({
+    id: 'close.any', key: 'Esc', label: 'Close the topmost panel or menu', group: 'Interface', allowInInput: true,
+    run: () => {
+      if (!ratePopover.hidden) return show(ratePopover, false);
+      if (menu.isOpen) return menu.close();
+      if (search.isOpen) return search.close();
+      if (anyDialogOpen()) { for (const [id] of dialogs) toggleDialog(id, false); return; }
+      if (isImmersive()) return setImmersive(false);
+      return undefined;
+    },
+  });
+
+  function nextRate(direction) {
+    const magnitude = Math.abs(state.timeRate) || 1;
+    const sign = Math.sign(state.timeRate) || 1;
+    return direction > 0 ? magnitude * 10 * sign : Math.max(magnitude / 10, 1) * sign;
+  }
+
+  function buildHelpKeys() {
+    const groups = shortcuts.list();
+    helpKeys.replaceChildren();
+    for (const [group, actions] of groups) {
+      append(helpKeys, [
+        el('div', { class: 'section-title', style: { gridColumn: '1 / -1' }, text: group }),
+        ...actions.flatMap((action) => [
+          el('button', {
+            type: 'button', class: 'rebind', text: prettyChord(action.binding) || 'unset',
+            title: 'Click, then press the key you want',
+            onClick: (event) => listenForRebind(event.currentTarget, action.id),
+          }),
+          el('span', { text: action.label }),
+        ]),
+      ]);
+    }
+  }
+
+  function listenForRebind(button, id) {
+    css(button, 'is-listening', true);
+    text(button, 'press\u2026');
+    const capture = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      window.removeEventListener('keydown', capture, true);
+      if (event.key !== 'Escape') {
+        // Chord is computed the same way dispatch computes it, so what is stored
+        // is guaranteed to match what a press produces.
+        const parts = [];
+        if (event.ctrlKey) parts.push('Ctrl');
+        if (event.metaKey) parts.push('Meta');
+        if (event.altKey) parts.push('Alt');
+        if (event.shiftKey) parts.push('Shift');
+        let key = event.key;
+        if (key === ' ') key = 'Space';
+        else if (key.length === 1) key = key.toUpperCase();
+        else if (key === 'Escape') key = 'Esc';
+        parts.push(key);
+        shortcuts.rebind(id, parts.join('+'));
+      }
+      buildHelpKeys();
+      syncRail();
+    };
+    window.addEventListener('keydown', capture, true);
+  }
+
+  // --------------------------------------------------------------- custom rate
+
+  /**
+   * Custom multiplier, as a small popover anchored to the clock rather than a
+   * browser prompt. A native dialog is the wrong texture for this interface, and
+   * it stops the render loop while it is up.
+   */
+  const rateInput = el('input', {
+    class: 'input',
+    type: 'number',
+    step: 'any',
+    'aria-label': 'Simulation seconds per real second',
+  });
+  const ratePopover = el('div', { class: 'menu rate-popover takes-pointer', hidden: true }, [
+    el('div', { class: 'menu-head' }, [
+      el('div', { class: 't', text: 'Time multiplier' }),
+      el('div', { class: 's', text: 'sim seconds per real second' }),
+    ]),
+    rateInput,
+    el('p', { class: 'prose', text: 'Negative values run time backwards.' }),
+  ]);
+  document.body.append(ratePopover);
+
+  function commitRate() {
+    const value = Number(rateInput.value);
+    show(ratePopover, false);
+    if (!Number.isFinite(value)) return;
+    timeBar.setRateAndPlay(value);
+  }
+
+  rateInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') commitRate();
+    else if (event.key === 'Escape') show(ratePopover, false);
+    event.stopPropagation();
+  });
+  rateInput.addEventListener('blur', () => commitRate());
+
+  function openCustomRate() {
+    rateInput.value = String(state.timeRate || 1);
+    show(ratePopover, true);
+    const anchor = timeBar.root.getBoundingClientRect();
+    const own = ratePopover.getBoundingClientRect();
+    ratePopover.style.left = `${Math.max(8, Math.min(anchor.right - own.width, window.innerWidth - own.width - 8))}px`;
+    ratePopover.style.top = `${anchor.bottom + 8}px`;
+    rateInput.focus();
+    rateInput.select();
+  }
+
+  // ------------------------------------------------------------------ picking
+
+  controls.onContextMenu = (x, y) => {
+    const key = hooks.pick(x, y);
+    if (key) openObjectMenu(x, y, key);
+  };
+
+  let hoverKey = null;
+  let hoverAt = { x: 0, y: 0 };
+  controls.onHover = (x, y) => {
+    hoverAt.x = x;
+    hoverAt.y = y;
+  };
+  canvas.addEventListener('pointerleave', () => {
+    hoverKey = null;
+    show(hover, false);
+  });
+
+  // -------------------------------------------------------------------- frame
+
+  let described = null;
+  let describedKey = null;
+  const lastWorld = { x: 0, y: 0, z: 0, set: false };
+  let velocity = 0;
+  let labelClock = 0;
+  let describeClock = 0;
+
+  function describeFor(key, resolved) {
+    return describe(resolved, {
+      galaxyRecord: hooks.galaxyRecord(key),
+      craftRecord: resolved.kind === 'craft' ? hooks.craftRecord(key) : null,
+      cameraDistanceKm: resolved.position.distanceTo(controls.worldPosition),
+      sunDistanceKm: hooks.sunDistanceTo(resolved.position),
+      nameOf: hooks.bodyName,
+    });
+  }
+
+  /**
+   * Called once per rendered frame from space.js.
+   *
+   * The expensive parts are on their own clocks: the label layer projects a few
+   * dozen candidates six times a second, and the hover probe runs at the same
+   * rate, because neither benefits from being recomputed between two frames the
+   * camera has barely moved through.
+   */
+  function frame({ dt, resolved, fps, patches, sunDistanceKm, width, height }) {
+    if (isImmersive()) {
+      labelLayer.clear();
+      show(hover, false);
+      return;
+    }
+
+    const cameraWorld = controls.worldPosition;
+
+    // Speed from the actual change in world position, which is the only thing
+    // that accounts for orbiting, flying, cruising and a scripted flight alike.
+    if (lastWorld.set && dt > 0) {
+      const moved = Math.hypot(
+        cameraWorld.x - lastWorld.x,
+        cameraWorld.y - lastWorld.y,
+        cameraWorld.z - lastWorld.z,
+      );
+      // Smoothed, or it is unreadable: exponential zoom changes speed by orders
+      // of magnitude between consecutive frames.
+      velocity = velocity * 0.9 + (moved / dt) * 0.1;
+    }
+    lastWorld.x = cameraWorld.x;
+    lastWorld.y = cameraWorld.y;
+    lastWorld.z = cameraWorld.z;
+    lastWorld.set = true;
+
+    if (prefs.get('hud')) {
+      hud.set('target', resolved?.name ?? state.target);
+      hud.set('distance', formatDistance(Math.max(controls.altitudeKm, 0)));
+      hud.set('velocity', velocity > 1e5 ? `${(velocity / 299792.458).toFixed(2)} c` : `${velocity.toFixed(velocity < 10 ? 2 : 0)} km/s`);
+      hud.set('heading', `${(((controls.yaw * 180) / Math.PI % 360) + 360) % 360 | 0}\u00b0`);
+      hud.set('fov', `${controls.fov.toFixed(1)}\u00b0`);
+      // AU is the readable unit across the solar system and nowhere else, so it
+      // is bounded at both ends and formatDistance takes over outside them —
+      // metres and kilometres on a surface, parsecs and megaparsecs once the
+      // camera has left. Bounded below only, a world in another galaxy read out
+      // as three and a half trillion AU, to three decimal places.
+      const sunAu = sunDistanceKm / AU_KM;
+      hud.set('sun', sunAu > 0.01 && sunAu < 1000
+        ? `${sunAu.toFixed(3)} AU`
+        : formatDistance(sunDistanceKm));
+      hud.set('mode', state.viewFromEarth ? 'GROUND' : currentMode().toUpperCase());
+      hud.set('fps', fps.toFixed(0));
+    }
+
+    scaleBar.update(controls.distanceKm);
+    timeBar.frame();
+    modeControl.set(currentMode());
+    // The mode can change without the mode control being touched: thrusting
+    // from orbit switches to flight, and so does F. Reconciled from the
+    // controls rather than from the last button press, so the pad turns up
+    // whenever thrust is live however that happened. Both calls no-op when
+    // nothing has changed.
+    // Roaming is thrust too, and this reconciliation used to name only 'fly' —
+    // so entering roam raised the pad and the next frame took it away again.
+    flight.setVisible(
+      !state.viewFromEarth && (controls.mode === 'fly' || controls.mode === 'roam' || controls.mode === 'walk'),
+    );
+    flight.setRoaming(controls.mode === 'roam');
+    flight.setWalking(controls.mode === 'walk');
+    flight.setShip(Boolean(controls.pilot) && controls.mode === 'roam');
+    flight.sync();
+    flight.setReadout(hooks.roamReadout?.() ?? null);
+    if (!quality.panel.root.hidden) quality.update(hooks.qualityStats?.());
+
+    // The inspector's numbers move; its structure does not. Rebuild the
+    // description only when the selection changes or a few times a second.
+    const key = state.target;
+    describeClock += dt;
+    if (key !== describedKey || describeClock > 0.16) {
+      describeClock = 0;
+      if (resolved) {
+        described = describeFor(key, resolved);
+        describedKey = key;
+      } else {
+        described = null;
+        describedKey = null;
+      }
+    }
+
+    if (!inspectorPanel.root.hidden) {
+      inspector.render(described, key);
+      inspector.setCapabilities({
+        canLand: resolved?.kind === 'body',
+        canFollow: Boolean(resolved),
+        canRide: resolved?.kind === 'craft' && !resolved.craft?.onSurface,
+        riding: hooks.isRiding?.() === resolved?.craft?.key,
+      });
+      inspector.setMode(currentMode());
+    }
+
+    for (const button of quickList.children) css(button, 'is-active', button.dataset.key === key);
+
+    if (!panels.get('system').root.hidden) buildSystemTree(resolved);
+
+    labelClock += dt;
+    if (labelClock > 0.16) {
+      labelClock = 0;
+      if (prefs.get('labels')) {
+        labelLayer.update({
+          camera,
+          cameraWorld,
+          width,
+          height,
+          items: hooks.collectLabelItems(),
+          targetKey: key,
+          density: prefs.get('labelDensity'),
+        });
+      }
+      // Hover probe on the same clock. Picking walks the destination list, which
+      // is not something to do every frame for a decoration.
+      if (hoverAt.x || hoverAt.y) {
+        const hit = hooks.pick(hoverAt.x, hoverAt.y);
+        hoverKey = hit;
+        if (hit) {
+          const hitResolved = resolveWorld(hit);
+          if (hitResolved) {
+            const distance = hitResolved.position.distanceTo(cameraWorld);
+            const pixels = (hitResolved.radius / Math.max(distance, 1)) * (height / ((camera.fov * Math.PI) / 180));
+            const size = Math.max(Math.min(pixels * 2.2, 220), 22);
+            hover.style.left = `${hoverAt.x}px`;
+            hover.style.top = `${hoverAt.y}px`;
+            hoverBox.style.width = `${size}px`;
+            hoverBox.style.height = `${size}px`;
+            text(hoverName, hitResolved.name);
+            show(hover, true);
+          }
+        } else {
+          show(hover, false);
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- lifecycle
+
+  function syncCamera() {
+    fovSlider.set(controls.fov);
+    modeControl.set(currentMode());
+  }
+
+  buildHelpKeys();
+  buildBookmarks();
+  syncDisplay();
+  syncRail();
+  setCameraMode('orbit');
+
+  /**
+   * Pushes the saved options into the renderer, so there is one direction of
+   * travel: preferences decide, the scene follows.
+   *
+   * Called by the app rather than run here, because half of what these switches
+   * reach — the bloom pass, the dither pass — is built after the interface is,
+   * and a checkbox restored against a post-processing chain that does not exist
+   * yet fails at startup.
+   */
+  function applyViewPrefs() {
+    for (const group of VIEW_GROUPS) {
+      for (const option of group.options) {
+        hooks.setView?.(option.key, prefs.get(`view.${option.key}`, option.default));
+      }
+    }
+    hooks.setMaxRenderScale?.(prefs.get('quality.maxRenderScale', platform.maxRenderScale));
+    hooks.setTargetFps?.(prefs.get('quality.targetFps', platform.targetFps));
+    hooks.setQualityPreset?.(prefs.get('quality.preset', 'auto'));
+  }
+
+  return {
+    frame,
+    syncCamera,
+    applyViewPrefs,
+    prefs,
+    shortcuts,
+    // Exposed so something outside the panel can change a view option without
+    // the checkbox that shows it going stale — the macOS menu toggles music
+    // this way, and the Display panel it mirrors stays in step.
+    setViewOption,
+    setImmersive,
+    togglePanel,
+    toggleDialog,
+    focusSearch: () => search.focus(),
+    // Called once the loading screen is out of the way, so the card is not
+    // competing with a progress bar for the same middle of the screen.
+    showIntroIfNew: () => intro.maybeShow(),
+    setCameraMode,
+    currentMode,
+    runAction,
+    openObjectMenu,
+  };
+}

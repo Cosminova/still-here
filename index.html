@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Still Here — stories of the machines NASA left behind</title>
+    <link rel="icon" href="favicon.png" type="image/png" />
+    <link rel="stylesheet" href="src/ui/theme.css" />
+    <link rel="stylesheet" href="src/style.css" />
+    <link rel="stylesheet" href="src/story/story.css" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <!--
+      Everything below the canvas is built by src/ui/explorer-ui.js. The markup
+      is not written out here because most of it is data-driven — panels come and
+      go, their contents depend on what is selected, and their visibility is
+      restored from saved preferences at startup. Only the canvas, the loading
+      cover and the mount points are static.
+    -->
+    <div id="label-layer" class="label-layer" aria-hidden="true"></div>
+    <div id="ui-root"></div>
+
+    <div id="loading">
+      <div class="loading-inner">
+        <div class="loading-title">STILL HERE</div>
+        <div class="loading-bar"><div id="loading-fill"></div></div>
+        <div id="loading-status" class="loading-sub">loading catalogues and surface imagery…</div>
+      </div>
+    </div>
+
+    <!--
+      The start screen, over the loading cover, on every version of the app.
+
+      In the markup rather than built by src/ui/home.js like the rest of the
+      interface, because this is the first thing anyone sees and it should be on
+      the screen at first paint — not after a megabyte of module has parsed. So
+      it ships visible and ui/home.js decides whether it applies: everything
+      with a person in front of it keeps it, and the capture and check scripts,
+      which drive this page in headless Chrome, have it taken away.
+
+      Empty of a backdrop on purpose. Which of the three in public/home is used
+      is decided per visit so that only one is ever fetched, the gradient below
+      is what stands in until it has decoded, and once the scene behind is
+      loaded that same shot takes over live — see src/ui/home.js.
+    -->
+    <div id="home" class="home">
+      <div id="home-backdrop" class="home-backdrop"></div>
+      <div class="home-inner">
+        <h1 class="home-title">STILL HERE</h1>
+        <p class="home-tagline">Stories of the machines NASA left behind on the Moon, on Mars and in deep space</p>
+        <button type="button" id="home-start" class="home-start" disabled>
+          getting the universe ready…
+        </button>
+      </div>
+    </div>
+
+    <script type="module" src="src/space.js"></script>
+  </body>
+</html>

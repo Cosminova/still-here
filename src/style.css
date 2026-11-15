@@ -1,0 +1,751 @@
+/**
+ * Universe explorer layout.
+ *
+ * Everything shared with the planetarium lives in ui/theme.css; this file only
+ * places the explorer's own regions. The governing constraint is that the middle
+ * of the screen stays empty: panels are pinned to the edges, they are allowed to
+ * be tall but never wide, and the centre column of the layout grid holds nothing
+ * but the reticle.
+ */
+
+#view {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: crosshair;
+  /* The long press that stands in for a right-click here is the same gesture
+     iOS uses to offer a selection or a share sheet, and it wins: the callout
+     appears over the object menu and the press that opened it is swallowed. */
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#view:active {
+  cursor: grabbing;
+}
+
+/* ------------------------------------------------------------------ bottom */
+
+.hud {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-4);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Readouts drop off the right end as the window narrows rather than wrapping the
+   bar onto a second line, which would eat into the view. Each is marked with the
+   width at which it stops being worth the space. */
+.hud .readout {
+  flex: none;
+}
+
+/* The scale bar sits above the bottom bar, centred, and is purely informational
+   so it never takes pointer events. */
+/* Also viewport-fixed, for the same reason as the reticle: it reads as a caption
+   under the centre of the view and has to actually be under it. */
+.scalebar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--edge-bottom) + 44px * var(--ui-scale));
+  transform: translateX(-50%);
+  z-index: 11;
+  display: grid;
+  justify-items: center;
+  gap: var(--sp-1);
+  pointer-events: none;
+  user-select: none;
+}
+
+.scalebar .s-label {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.scalebar .s-track {
+  width: calc(120px * var(--ui-scale));
+  height: 1px;
+  background: rgba(160, 195, 235, 0.5);
+  position: relative;
+}
+
+/* End ticks, so the bar reads as a measured span rather than a divider. */
+.scalebar .s-track::before,
+.scalebar .s-track::after {
+  content: '';
+  position: absolute;
+  top: -3px;
+  width: 1px;
+  height: 7px;
+  background: rgba(160, 195, 235, 0.5);
+}
+
+.scalebar .s-track::before { left: 0; }
+.scalebar .s-track::after { right: 0; }
+
+/*
+ * The flight pad takes the bottom centre in the flying modes, which is where
+ * the scale bar sits. The bar moves rather than the pad, because the pad is a
+ * control that wants to be near the readouts it changes and the bar is only a
+ * legend — it reads the same anywhere along the bottom.
+ */
+body.is-flying .scalebar {
+  bottom: calc(var(--edge-bottom) + 122px * var(--ui-scale));
+}
+
+/* The touch pad's keycaps are 46 points tall instead of 26, so the pad it is
+   being lifted over is about fifteen points taller than the number above
+   assumes — enough that the legend lands on its top border. */
+html.is-touch body.is-flying .scalebar {
+  bottom: calc(var(--edge-bottom) + 140px * var(--ui-scale));
+}
+
+/*
+ * A phone turned sideways is under 400 points tall, and lifting the legend the
+ * height of the pad puts it beside the reticle — the middle of the view, which
+ * is the one place the layout keeps clear. The portrait phone tier already
+ * drops the bar while the pad is up for the same reason; this is that rule
+ * again for the landscape shape, where the width tier does not reach.
+ */
+@media (max-height: 480px) {
+  html.is-touch body.is-flying .scalebar {
+    display: none;
+  }
+}
+
+.scalebar {
+  transition: bottom var(--t-fast) var(--ease);
+}
+
+/* ------------------------------------------------------- panel internals */
+
+/* Destination shortcuts. A wrapping row of small chips rather than a list: there
+   are seventeen of them and a list that long would be taller than the panel. */
+.quick-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.quick-list .btn.quick {
+  font-size: var(--fs-tiny);
+  padding: 1px var(--sp-2);
+  background: transparent;
+  backdrop-filter: none;
+}
+
+.quick-list .btn.quick.is-active {
+  background: var(--accent);
+}
+
+/* The system view is a two-level tree — the primary and what orbits it — which
+   is as deep as the solar system actually goes. */
+.system-tree {
+  display: grid;
+  gap: var(--sp-1);
+}
+
+.tree-root {
+  justify-content: flex-start;
+  font-size: var(--fs-small);
+  color: var(--ink);
+}
+
+.tree-kids {
+  display: grid;
+  gap: 1px;
+  margin-left: var(--sp-3);
+  padding-left: var(--sp-3);
+  border-left: 1px solid var(--line);
+}
+
+.tree-kid {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  font-size: var(--fs-tiny);
+  padding: 1px var(--sp-2);
+}
+
+.tree-kid .tree-size {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--dim-2);
+}
+
+.tree-root.is-active,
+.tree-kid.is-active {
+  color: var(--accent);
+  background: var(--surface-active);
+}
+
+.bookmark-list {
+  display: grid;
+  gap: 1px;
+  margin-bottom: var(--sp-2);
+}
+
+.bookmark-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.bookmark-row .bookmark-go {
+  flex: 1;
+  justify-content: flex-start;
+  font-size: var(--fs-small);
+}
+
+.catalog {
+  display: grid;
+  grid-template-columns: calc(150px * var(--ui-scale)) minmax(0, 1fr);
+  gap: var(--sp-3);
+  width: 100%;
+  height: min(calc(520px * var(--ui-scale)), 72vh);
+}
+
+.dialog.is-center:has(.catalog) {
+  width: min(calc(780px * var(--ui-scale)), calc(100vw - var(--edge-left) - var(--edge-right)));
+}
+
+.catalog-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+}
+
+.catalog-tab {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font: inherit;
+  font-size: var(--fs-small);
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-2);
+  padding: var(--sp-1) var(--sp-2);
+  text-align: left;
+  cursor: pointer;
+}
+
+.catalog-tab:hover {
+  color: var(--ink);
+  background: var(--surface-hover);
+}
+
+.catalog-tab.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+.catalog-count {
+  font-size: var(--fs-tiny);
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+
+.catalog-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+}
+
+.catalog-filter {
+  width: 100%;
+}
+
+.catalog-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.catalog-chip {
+  font: inherit;
+  font-size: var(--fs-tiny);
+  color: var(--dim);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px var(--sp-2);
+  cursor: pointer;
+}
+
+.catalog-chip:hover {
+  color: var(--ink);
+}
+
+.catalog-chip.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.catalog-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.catalog-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.catalog-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--sp-3);
+  font: inherit;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: calc(var(--sp-1) + 1px) var(--sp-1);
+  text-align: left;
+  cursor: pointer;
+}
+
+.catalog-row:hover {
+  background: var(--surface-hover);
+}
+
+.catalog-name {
+  min-width: 0;
+  font-size: var(--fs-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-meta {
+  font-size: var(--fs-tiny);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.catalog-more {
+  margin-top: var(--sp-2);
+  width: 100%;
+}
+
+.catalog-empty {
+  color: var(--dim);
+  font-size: var(--fs-small);
+  padding: var(--sp-3) 0;
+}
+
+@media (max-width: 640px) {
+  .catalog {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .catalog-tabs {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+
+  .catalog-tab {
+    flex: none;
+  }
+}
+
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(calc(112px * var(--ui-scale)), 1fr));
+  gap: var(--sp-1);
+}
+
+.catalog-grid .btn {
+  justify-content: flex-start;
+  font-size: var(--fs-tiny);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  white-space: nowrap;
+}
+
+.rate-popover {
+  width: calc(210px * var(--ui-scale));
+  padding: var(--sp-2);
+}
+
+.rate-popover .input {
+  width: 100%;
+  margin-bottom: var(--sp-2);
+}
+
+.rate-popover .prose {
+  margin: 0;
+  font-size: var(--fs-micro);
+  color: var(--dim);
+}
+
+/* The hover indicator is a bracket around whatever is under the cursor, with its
+   name above. Positioned in screen space from the render loop. */
+.hover-target {
+  position: fixed;
+  z-index: 12;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  transition: opacity var(--t-fast) var(--ease);
+}
+
+.hover-box {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--accent);
+  opacity: 0.55;
+  /* Corner brackets only, cut from a full border with a mask. */
+  -webkit-mask-image:
+    linear-gradient(to right, #000 0 26%, transparent 26% 74%, #000 74% 100%),
+    linear-gradient(to bottom, #000 0 26%, transparent 26% 74%, #000 74% 100%);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(to right, #000 0 26%, transparent 26% 74%, #000 74% 100%),
+    linear-gradient(to bottom, #000 0 26%, transparent 26% 74%, #000 74% 100%);
+  mask-composite: intersect;
+}
+
+.hover-name {
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  transform: translate(-50%, calc(-1 * var(--sp-2)));
+  padding: 1px var(--sp-2);
+  background: var(--surface-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-1);
+  font-size: var(--fs-tiny);
+  color: var(--ink);
+  white-space: nowrap;
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+}
+
+/* ----------------------------------------------------------------- labels */
+
+.label-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 9;
+  pointer-events: none;
+  overflow: hidden;
+  transition: opacity var(--t-mid) var(--ease);
+}
+
+.obj-label {
+  position: absolute;
+  transform: translate(0, -50%);
+  font-size: var(--fs-tiny);
+  line-height: 1.25;
+  white-space: nowrap;
+  color: var(--ink-2);
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.9), 0 0 10px rgba(0, 0, 0, 0.7);
+  will-change: transform;
+}
+
+.obj-label .l-name {
+  color: var(--ink);
+}
+
+.obj-label .l-dist {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-micro);
+  color: var(--dim);
+}
+
+.obj-label.is-target .l-name {
+  color: var(--accent);
+}
+
+/* A dot marks the object itself; the text is offset so it does not sit on top of
+   what it names. */
+.obj-label::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--sp-3));
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin-top: -1.5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.6;
+}
+
+/* ----------------------------------------------------------------- touch
+
+   The panel internals, which are dense on purpose and cannot stay that dense
+   under a finger. The shared chrome is handled in ui/theme.css; these are the
+   explorer's own lists, and the reason they are here rather than left small is
+   that the destination chips are what the welcome card tells you to press
+   first. A row of 20-point chips is the wrong thing to hand someone who has
+   just been told to tap one.
+
+   They grow in height only. Widening them would reflow the wrapping row into
+   twice as many lines for no gain, and the panels scroll, so height is cheap
+   here in a way it is not in a bar. */
+
+html.is-touch .quick-list .btn.quick,
+html.is-touch .catalog-grid .btn,
+html.is-touch .tree-root,
+html.is-touch .tree-kid,
+html.is-touch .bookmark-row .btn {
+  min-height: 40px;
+}
+
+html.is-touch .quick-list {
+  gap: var(--sp-2);
+}
+
+/* ------------------------------------------------------------- responsive */
+
+/* The shared rules — how the regions and docked panels give way — are in
+   ui/theme.css. What is left here is the bottom HUD, whose readouts drop off the
+   right end as the window narrows rather than wrapping onto a second line. Each
+   is marked with the width at which it stops being worth the space. */
+
+@media (max-width: 1180px) {
+  .hud .readout[data-opt='1'] { display: none; }
+}
+
+@media (max-width: 980px) {
+  .hud .readout[data-opt='2'] { display: none; }
+}
+
+@media (max-width: 820px) {
+  .hud .readout[data-opt='3'] { display: none; }
+}
+
+/* Phone. The stacking is in ui/theme.css; what is left here is the bottom of
+   the explorer specifically, where the flight pad now takes a full-width row of
+   its own and the scale bar has to get out of its way. */
+@media (max-width: 480px) {
+  /* Target and distance are what is left after the drops above, and they are
+     the two that matter: what you are looking at and how far away it is. */
+  .hud {
+    padding: var(--sp-2) var(--sp-3);
+    gap: var(--sp-3);
+    justify-content: center;
+  }
+
+  .scalebar {
+    bottom: calc(var(--edge-bottom) + 52px * var(--ui-scale));
+  }
+
+  /*
+   * With the pad on its own row the bottom bar is around 160 points tall, and
+   * lifting the scale bar clear of that would push a legend into the middle of
+   * the view — which is the one thing the layout will not do. So while the pad
+   * is up the bar goes instead: it is a caption saying how wide the frame is,
+   * and the control that flies you somewhere is worth more than knowing that.
+   */
+  body.is-flying .scalebar {
+    display: none;
+  }
+}
+
+/* -------------------------------------------------------------------- home
+
+   The start screen, over the loading cover. See index.html for why it is in the
+   markup, and ui/home.js for what turns it into a door.
+
+   Type here is sized against the viewport rather than off --ui-scale, which
+   everything else in this file uses. That variable is the user's preference for
+   how large the instrument panel should be, and this is not the instrument
+   panel: it is a title over a photograph, and it should be the same size on a
+   given screen whether or not somebody has since decided they want small
+   readouts. */
+
+#home {
+  position: fixed;
+  inset: 0;
+  /* Over the loading cover, which is 100 and stays underneath doing its job. */
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  /* The same gradient as the loading cover, so that the moment before the
+     backdrop has decoded looks deliberate rather than empty — and so that a
+     shell removing this screen removes something indistinguishable from what
+     is behind it. */
+  background: radial-gradient(circle at 50% 45%, #0a1020 0%, var(--void) 72%);
+  transition: opacity 520ms var(--ease);
+}
+
+/* Only once there is something to start. Before that the whole cover is inert
+   and the button says what it is waiting for. */
+#home.is-ready {
+  cursor: pointer;
+}
+
+#home.is-going {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* The scene behind has been framed on the same shot as the still, so both the
+   gradient and the photograph get out of its way. Only these two: the vignette
+   and the type stay, because they are what makes a title readable over a lit
+   globe, and that is as true of the live one as of the picture of it. */
+#home.is-live {
+  background: none;
+}
+
+#home.is-live .home-backdrop {
+  opacity: 0;
+  /* Slower than it arrived. Coming in, the picture is replacing an empty
+     gradient and wants to be quick; going out, it is being replaced by the
+     same view alive, and the two should overlap long enough that nothing
+     appears to blink. */
+  transition: opacity 2200ms var(--ease);
+}
+
+.home-backdrop {
+  position: absolute;
+  inset: 0;
+  background-position: center;
+  background-size: cover;
+  /* Faded in from nothing when the image reports itself decoded, so the screen
+     never shows a half-painted photograph. */
+  opacity: 0;
+  transition: opacity 1400ms var(--ease);
+}
+
+.home-backdrop.is-loaded {
+  opacity: 1;
+  /* A minute per pass, which is slow enough that it reads as the frame being
+     alive rather than as something moving. */
+  animation: home-drift 60s ease-in-out infinite alternate;
+}
+
+@keyframes home-drift {
+  from { transform: scale(1.04); }
+  to { transform: scale(1.13) translate3d(-1.2%, -0.8%, 0); }
+}
+
+/* A vignette over the picture and under the type.
+
+   Two layers, because the three backdrops put their brightness in three
+   different places — a lensed disc off to one side, a lit globe in the middle,
+   a horizon band across it. The radial one guarantees the title has something
+   dark behind it whichever of those turned up; the linear one weights the top
+   and bottom so the title and the button both sit on their own ground. */
+#home::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(58% 48% at 50% 50%, rgba(4, 5, 10, 0.74) 0%, rgba(4, 5, 10, 0.34) 60%, rgba(4, 5, 10, 0) 100%),
+    linear-gradient(to bottom, rgba(4, 5, 10, 0.5) 0%, rgba(4, 5, 10, 0) 30%, rgba(4, 5, 10, 0) 58%, rgba(4, 5, 10, 0.66) 100%);
+}
+
+.home-inner {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  justify-items: center;
+  padding: var(--edge-top) var(--edge-right) var(--edge-bottom) var(--edge-left);
+  text-align: center;
+}
+
+.home-title {
+  margin: 0;
+  font-family: var(--mono);
+  font-weight: 400;
+  font-size: clamp(26px, 6.4vw, 58px);
+  letter-spacing: 0.5em;
+  /* Letter-spacing is applied after the last letter too, so a centred line sits
+     half a space to the left of where it looks like it should. */
+  text-indent: 0.5em;
+  color: var(--ink);
+  text-shadow: 0 2px 40px rgba(0, 0, 0, 0.7);
+}
+
+.home-tagline {
+  margin: var(--sp-4) 0 0;
+  font-size: clamp(10px, 1.5vw, 13px);
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  text-shadow: 0 1px 20px rgba(0, 0, 0, 0.8);
+}
+
+/*
+ * Waiting, and then a way in. The same element does both so that nothing moves
+ * when the app becomes ready: the label is replaced and the border arrives.
+ */
+.home-start {
+  margin-top: clamp(28px, 6vh, 64px);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  font: inherit;
+  font-size: clamp(11px, 1.6vw, 14px);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+  transition: color var(--t-slow) var(--ease), border-color var(--t-slow) var(--ease),
+    background-color var(--t-slow) var(--ease);
+}
+
+.home-start:disabled {
+  cursor: default;
+}
+
+.home-start.is-ready {
+  padding: clamp(12px, 1.6vh, 16px) clamp(26px, 4vw, 40px);
+  border-color: var(--line-2);
+  background: rgba(9, 13, 21, 0.5);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  color: var(--ink);
+  cursor: pointer;
+  animation: home-breathe 3.4s ease-in-out infinite;
+}
+
+.home-start.is-ready:hover,
+.home-start.is-ready:focus-visible {
+  border-color: var(--accent);
+  background: rgba(14, 21, 33, 0.66);
+  /* Stop drawing attention to itself once it plainly has it. */
+  animation: none;
+}
+
+@keyframes home-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
+  50% { box-shadow: 0 0 26px 2px var(--accent-glow); }
+}
+
+/* The drift and the breath are decoration, and the theme's reduced-motion block
+   only zeroes transition durations — an animation has to be stopped by name. */
+@media (prefers-reduced-motion: reduce) {
+  .home-backdrop.is-loaded,
+  .home-start.is-ready {
+    animation: none;
+  }
+}

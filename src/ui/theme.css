@@ -1,0 +1,2304 @@
+/**
+ * Cosminova design system.
+ *
+ * The whole interface is an instrument sitting on top of the view, so every
+ * decision here is in service of one rule: the universe is the subject and the
+ * chrome is not. Panels are translucent and thin-bordered, type is small,
+ * controls are compact, and nothing occupies the middle of the screen.
+ *
+ * Everything is expressed against the custom properties below so the user can
+ * rescale, retint and change the opacity of the entire interface at runtime
+ * without a stylesheet knowing about it.
+ */
+
+:root {
+  /* Set at runtime from saved preferences; see ui/prefs.js. */
+  --ui-scale: 1;
+  --ui-alpha: 0.72;
+  --ui-accent-h: 199;
+  --ui-accent-s: 100%;
+  --ui-accent-l: 72%;
+
+  --accent: hsl(var(--ui-accent-h) var(--ui-accent-s) var(--ui-accent-l));
+  --accent-dim: hsl(var(--ui-accent-h) 60% 62%);
+  /* Text laid over a filled accent surface. Dark, because the accent is always
+     a light tint — a light-on-light pairing is the usual way an accent colour
+     picker produces something unreadable. */
+  --accent-ink: hsl(var(--ui-accent-h) 90% 8%);
+  --accent-glow: hsl(var(--ui-accent-h) var(--ui-accent-s) var(--ui-accent-l) / 0.22);
+
+  --void: #04050a;
+  --ink: #e8eef7;
+  --ink-2: #b9c5d6;
+  --dim: #8492a6;
+  --dim-2: #5d6a7d;
+
+  /* Three panel depths. Rails and bars sit closest to the view and are the most
+     transparent; dialogues that need to be read sit furthest and are nearly
+     opaque, because text over a moving starfield is unreadable otherwise. */
+  --surface-1: rgba(9, 13, 21, calc(var(--ui-alpha) * 0.82));
+  --surface-2: rgba(10, 15, 24, var(--ui-alpha));
+  --surface-3: rgba(7, 10, 17, calc(0.62 + var(--ui-alpha) * 0.36));
+  --surface-hover: rgba(120, 165, 215, 0.09);
+  --surface-active: rgba(120, 165, 215, 0.14);
+
+  --line: rgba(140, 175, 215, 0.14);
+  --line-2: rgba(140, 175, 215, 0.26);
+
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+
+  /* Type scale, all derived from --ui-scale so one slider moves the interface
+     coherently instead of resizing panels and leaving the text behind. */
+  --fs-micro: calc(9px * var(--ui-scale));
+  --fs-tiny: calc(10px * var(--ui-scale));
+  --fs-small: calc(11px * var(--ui-scale));
+  --fs-body: calc(12px * var(--ui-scale));
+  --fs-large: calc(14px * var(--ui-scale));
+  --fs-title: calc(17px * var(--ui-scale));
+
+  --sp-1: calc(3px * var(--ui-scale));
+  --sp-2: calc(6px * var(--ui-scale));
+  --sp-3: calc(9px * var(--ui-scale));
+  --sp-4: calc(12px * var(--ui-scale));
+  --sp-5: calc(16px * var(--ui-scale));
+  --sp-6: calc(22px * var(--ui-scale));
+
+  --r-1: 4px;
+  --r-2: 7px;
+  --r-3: 10px;
+
+  --blur: blur(14px) saturate(1.1);
+  --edge: calc(12px * var(--ui-scale));
+  /*
+     Edge padding, per side, because on a phone the four sides are not the same.
+     A notch eats the top, a home indicator eats the bottom, and in landscape the
+     notch moves to whichever side the camera ended up on — so a single margin
+     cannot satisfy all four and something ends up underneath the hardware.
+
+     `env()` is the only thing that knows where the hardware is, and it resolves
+     to zero everywhere there is none: on a desktop these are exactly `--edge`,
+     which is why the regions below can use them unconditionally rather than
+     behind a media query that would also catch a touchscreen laptop. The
+     explicit `0px` fallback covers a browser that has env() but not this inset.
+
+     They are only non-zero if the document asks for the full screen with
+     `viewport-fit=cover`; explorer-ui.js does that on touch, since without it
+     the browser insets the whole viewport instead and there is nothing to
+     compensate for.
+  */
+  --edge-top: calc(var(--edge) + env(safe-area-inset-top, 0px));
+  --edge-right: calc(var(--edge) + env(safe-area-inset-right, 0px));
+  --edge-bottom: calc(var(--edge) + env(safe-area-inset-bottom, 0px));
+  --edge-left: calc(var(--edge) + env(safe-area-inset-left, 0px));
+  --rail-w: calc(42px * var(--ui-scale));
+  /* Trimmed from 178px. The rail now opens by default, so its width is spent on
+     every visit rather than only when someone asks for it, and it is spent out
+     of the margin the scene has on the left before a panel beside it starts
+     covering the middle of the frame. 156px still holds every label. */
+  --rail-w-open: calc(156px * var(--ui-scale));
+
+  /* One easing for everything that moves. Slightly overshoot-free and quick
+     enough that the interface never feels like it is animating at you. */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --t-fast: 130ms;
+  --t-mid: 200ms;
+  --t-slow: 320ms;
+}
+
+/* Honour the system setting rather than animating regardless. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 0ms;
+    --t-mid: 0ms;
+    --t-slow: 0ms;
+  }
+}
+
+/* Set for one frame when the interface has to reach a state immediately, e.g. a
+   capture script hiding it. Zeroing the durations rather than removing the
+   transitions keeps every rule below written the one way. */
+body.no-ui-anim,
+body.no-ui-anim * {
+  --t-fast: 0ms;
+  --t-mid: 0ms;
+  --t-slow: 0ms;
+  transition: none !important;
+  animation: none !important;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--void);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* Numbers are read by eye against each other constantly — distances ticking
+   down, coordinates changing — so they are tabular everywhere. Without this,
+   digits of different widths make a readout jitter as it counts. */
+.num,
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+::selection {
+  background: var(--accent-glow);
+}
+
+/* ---------------------------------------------------------------- scrollbars */
+
+.scroll {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+  overscroll-behavior: contain;
+}
+
+.scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroll::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(160, 195, 235, 0.4);
+  background-clip: content-box;
+}
+
+/* -------------------------------------------------------------------- layout */
+
+/* The interface is a grid of edge regions with a hole in the middle. Regions are
+   pointer-transparent and only their children take events, so the view can be
+   dragged through the gaps between panels. */
+.ui-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-rows: auto 1fr auto;
+  grid-template-areas:
+    'top    top     top'
+    'left   center  right'
+    'bottom bottom  bottom';
+}
+
+.ui-layer > * {
+  pointer-events: none;
+}
+
+.ui-layer button,
+.ui-layer input,
+.ui-layer select,
+.ui-layer a,
+.ui-layer .panel,
+.ui-layer .takes-pointer {
+  pointer-events: auto;
+}
+
+.region-top { grid-area: top; display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--edge-top) var(--edge-right) var(--edge) var(--edge-left); }
+.region-left { grid-area: left; display: flex; align-items: center; gap: var(--sp-3); padding: 0 0 0 var(--edge-left); min-height: 0; }
+/* Panels stack downward beside the rail. `min-height: 0` and the scroll are what
+   keep a tall stack from growing the grid row and pushing the bottom bar off. */
+.region-left > .dock,
+.region-right > .dock { display: flex; flex-direction: column; gap: var(--sp-3); min-height: 0; max-height: 100%; overflow-y: auto; scrollbar-width: none; }
+.region-left > .dock::-webkit-scrollbar,
+.region-right > .dock::-webkit-scrollbar { display: none; }
+.region-right { grid-area: right; display: flex; flex-direction: column; align-items: flex-end; gap: var(--sp-3); padding: 0 var(--edge-right); min-height: 0; overflow: hidden; }
+.region-bottom { grid-area: bottom; display: flex; align-items: flex-end; justify-content: space-between; gap: var(--sp-3); padding: var(--edge) var(--edge-right) var(--edge-bottom) var(--edge-left); flex-wrap: wrap; }
+.region-center { grid-area: center; position: relative; }
+
+/* --------------------------------------------------------------------- panel */
+
+.panel {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  /* Deliberately almost no shadow: a drop shadow over a starfield reads as a
+     smudge, and the border plus the blur already separate panel from sky. */
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  color: var(--ink);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  cursor: default;
+  user-select: none;
+}
+
+.panel-title {
+  flex: 1;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.panel-body {
+  padding: var(--sp-3);
+}
+
+/* Collapse animates on a grid row rather than max-height, so a panel whose
+   content changes height does not need its animation retuned. */
+.panel-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--t-mid) var(--ease), opacity var(--t-fast) var(--ease);
+}
+
+.panel-collapse > * {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel.is-collapsed .panel-collapse {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+/* A zero-height track still cannot be shorter than the body's own padding, so a
+   collapsed panel would keep a few pixels of empty translucent panel below the
+   header. Zeroing the block padding takes it to exactly the header. */
+.panel.is-collapsed .panel-collapse > * {
+  padding-top: 0;
+  padding-bottom: 0;
+  transition: padding var(--t-mid) var(--ease);
+}
+
+.panel.is-collapsed .panel-head {
+  border-bottom-color: transparent;
+}
+
+/* Panels fade and lift slightly rather than sliding a long way; a big slide
+   across the view is exactly the kind of animation that draws the eye off the
+   thing the interface exists to show. */
+.panel.is-entering {
+  animation: panel-in var(--t-mid) var(--ease);
+}
+
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.99); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ------------------------------------------------------------------ controls */
+
+.btn {
+  font: inherit;
+  font-size: var(--fs-small);
+  color: var(--ink-2);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  padding: calc(var(--sp-1) + 1px) var(--sp-3);
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  transition: color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+.btn:hover {
+  color: var(--ink);
+  border-color: var(--line-2);
+  background: var(--surface-hover);
+}
+
+.btn:active {
+  transform: translateY(0.5px);
+}
+
+.btn.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn.is-quiet {
+  background: transparent;
+  border-color: transparent;
+  backdrop-filter: none;
+}
+
+.btn.is-quiet:hover {
+  background: var(--surface-hover);
+}
+
+.btn.is-icon {
+  padding: 0;
+  width: calc(24px * var(--ui-scale));
+  height: calc(24px * var(--ui-scale));
+  justify-content: center;
+}
+
+.btn[disabled] {
+  opacity: 0.38;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* Focus is visible for keyboard users only. A permanent ring on every control
+   would add a great deal of visual noise to a deliberately quiet interface. */
+.ui-layer :focus-visible,
+.dialog :focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ui-layer :focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Segmented control: for small sets of mutually exclusive choices, which is
+   most of the modal state in this interface (camera mode, time rate). */
+.segmented {
+  display: inline-flex;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  overflow: hidden;
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+}
+
+.segmented button {
+  font: inherit;
+  font-size: var(--fs-small);
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--line);
+  padding: calc(var(--sp-1) + 1px) var(--sp-3);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+}
+
+.segmented button:last-child {
+  border-right: 0;
+}
+
+.segmented button:hover {
+  color: var(--ink);
+  background: var(--surface-hover);
+}
+
+.segmented button.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+/* ------------------------------------------------------------------- sliders */
+
+.field {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-small);
+  color: var(--dim);
+  padding: var(--sp-1) 0;
+}
+
+.field > .field-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.field > .field-value {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-tiny);
+  color: var(--ink);
+  text-align: right;
+}
+
+.field > input[type='range'] {
+  grid-column: 1 / -1;
+}
+
+/* A field whose control sits beside its label rather than under it, for the
+   segmented buttons that are narrow enough to share the row. */
+.field.is-row {
+  grid-template-columns: 1fr auto;
+}
+
+.quality-readout {
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-tiny);
+  color: var(--dim-2);
+}
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: calc(14px * var(--ui-scale));
+  background: transparent;
+  outline: none;
+  cursor: pointer;
+  margin: 0;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(140, 175, 215, 0.22);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: calc(10px * var(--ui-scale));
+  height: calc(10px * var(--ui-scale));
+  margin-top: calc((2px - 10px * var(--ui-scale)) / 2);
+  border-radius: 50%;
+  background: var(--ink);
+  border: 0;
+  transition: background var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+
+input[type='range']:hover::-webkit-slider-thumb,
+input[type='range']:focus-visible::-webkit-slider-thumb {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+input[type='range']::-moz-range-track {
+  height: 2px;
+  border-radius: 2px;
+  background: rgba(140, 175, 215, 0.22);
+}
+
+input[type='range']::-moz-range-thumb {
+  width: calc(10px * var(--ui-scale));
+  height: calc(10px * var(--ui-scale));
+  border: 0;
+  border-radius: 50%;
+  background: var(--ink);
+}
+
+input[type='range']:hover::-moz-range-thumb {
+  background: var(--accent);
+}
+
+/* ------------------------------------------------------- checks and switches */
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-small);
+  color: var(--dim);
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+  transition: color var(--t-fast) var(--ease);
+}
+
+.check:hover {
+  color: var(--ink-2);
+}
+
+.check input {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: calc(13px * var(--ui-scale));
+  height: calc(13px * var(--ui-scale));
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-1);
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+  position: relative;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+
+.check input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.check input:checked::after {
+  content: '';
+  position: absolute;
+  left: 32%;
+  top: 10%;
+  width: 26%;
+  height: 55%;
+  border: solid var(--accent-ink);
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(42deg);
+}
+
+/* --------------------------------------------------------------------- input */
+
+.input {
+  font: inherit;
+  font-size: var(--fs-small);
+  color: var(--ink);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  padding: calc(var(--sp-1) + 1px) var(--sp-3);
+  outline: none;
+  min-width: 0;
+  transition: border-color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+}
+
+.input:focus {
+  border-color: var(--accent);
+  background: rgba(10, 15, 24, 0.9);
+}
+
+.input::placeholder {
+  color: var(--dim-2);
+}
+
+.input[type='search']::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+
+/* Chrome renders the datetime picker's own text nearly black on dark, and the
+   calendar glyph white-on-white; both need forcing. */
+input[type='datetime-local'] {
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------- key-value list */
+
+.kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-1) var(--sp-4);
+  font-size: var(--fs-small);
+  align-items: baseline;
+}
+
+.kv dt {
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.kv dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* A value that is prose rather than a number — a moon list, a morphology class —
+   reads badly right-aligned in a monospace face. */
+.kv dd.is-text {
+  font-family: var(--sans);
+  text-align: left;
+  color: var(--ink-2);
+  line-height: 1.45;
+}
+
+/* ------------------------------------------------------------------ readouts */
+
+.readout {
+  display: grid;
+  gap: 1px;
+}
+
+.readout .k {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.13em;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+
+.readout .v {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-small);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------- tooltip */
+
+.tooltip {
+  position: fixed;
+  z-index: 90;
+  pointer-events: none;
+  background: var(--surface-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-2);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-tiny);
+  color: var(--ink);
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+
+.tooltip.is-open {
+  opacity: 1;
+  transform: none;
+}
+
+.tooltip kbd {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--dim);
+  margin-left: var(--sp-2);
+}
+
+/* --------------------------------------------------------------------- menu */
+
+.menu {
+  position: fixed;
+  z-index: 80;
+  min-width: calc(168px * var(--ui-scale));
+  background: var(--surface-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-2);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  padding: var(--sp-1);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  transform-origin: top left;
+  animation: menu-in var(--t-fast) var(--ease);
+}
+
+@keyframes menu-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+
+.menu-head {
+  padding: var(--sp-1) var(--sp-2) var(--sp-2);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: var(--sp-1);
+}
+
+.menu-head .t {
+  font-size: var(--fs-small);
+  color: var(--ink);
+}
+
+.menu-head .s {
+  font-size: var(--fs-micro);
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.menu button {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  font: inherit;
+  font-size: var(--fs-small);
+  color: var(--ink-2);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-1);
+  padding: calc(var(--sp-1) + 1px) var(--sp-2);
+  cursor: pointer;
+  text-align: left;
+}
+
+.menu button:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+
+.menu button .sh {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--dim-2);
+}
+
+.menu hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: var(--sp-1) 0;
+}
+
+/* -------------------------------------------------------------------- dialog */
+
+.dialog {
+  position: fixed;
+  z-index: 70;
+  background: var(--surface-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  animation: panel-in var(--t-mid) var(--ease);
+  display: flex;
+  flex-direction: column;
+  /* Per-side rather than twice the margin, so a dialogue on a phone clears the
+     notch above it and the home indicator below it. Identical on a desktop,
+     where both insets are zero. */
+  max-height: min(78vh, calc(100vh - var(--edge-top) - var(--edge-bottom)));
+}
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.dialog-head h2 {
+  margin: 0;
+  flex: 1;
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.dialog-body {
+  padding: var(--sp-4);
+  min-height: 0;
+}
+
+/* Two placements: centred for reference material that wants the width, and
+   tucked under the top bar on the right for settings, which should not cover the
+   view it is changing. */
+.dialog.is-center {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(calc(680px * var(--ui-scale)), calc(100vw - var(--edge-left) - var(--edge-right)));
+}
+
+.dialog.is-right {
+  right: var(--edge-right);
+  top: calc(var(--edge-top) + 44px * var(--ui-scale));
+  width: min(calc(420px * var(--ui-scale)), calc(100vw - var(--edge-left) - var(--edge-right)));
+}
+
+/* ------------------------------------------------------------------ top bar */
+
+/* Both views put the same things across the top: a rail toggle, a wordmark, a
+   search field, and a group of controls at the right. */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-width: 0;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding-left: var(--sp-1);
+  user-select: none;
+  flex: none;
+}
+
+.brand-name {
+  font-family: var(--mono);
+  font-size: var(--fs-tiny);
+  letter-spacing: 0.34em;
+  color: var(--ink);
+}
+
+.brand-sub {
+  font-size: var(--fs-micro);
+  color: var(--dim-2);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.topbar-spacer {
+  flex: 1;
+  min-width: var(--sp-2);
+}
+
+/* ------------------------------------------------------------------- search */
+
+/* The search field lives in the top bar and grows into an overlay with results
+   below it. Capped in width so it never reaches across the view. */
+.search {
+  position: relative;
+  flex: 0 1 calc(300px * var(--ui-scale));
+  min-width: calc(150px * var(--ui-scale));
+}
+
+.search-input {
+  width: 100%;
+}
+
+.search-results {
+  position: absolute;
+  top: calc(100% + var(--sp-2));
+  left: 0;
+  width: calc(420px * var(--ui-scale));
+  max-width: min(calc(420px * var(--ui-scale)), calc(100vw - 2 * var(--edge)));
+  max-height: min(60vh, calc(520px * var(--ui-scale)));
+  /* The list scrolls at that height instead of running past it.
+     `max-height` on its own caps the box and nothing else: sixty rows kept
+     being laid out below it, over the scene, past the bottom of the window and
+     with the panel's border and background ending in the middle of them. A
+     one-letter query is enough to do it, so this was most of what search looked
+     like. The dock panels are capped the same way — see .panel-dock
+     .panel-body. */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+  background: var(--surface-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-2);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+  padding: var(--sp-1);
+  margin: 0;
+  list-style: none;
+  z-index: 40;
+  animation: panel-in var(--t-fast) var(--ease);
+}
+
+.search-results:empty {
+  display: none;
+}
+
+.search-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: 'name dist' 'meta dist';
+  gap: 0 var(--sp-3);
+  align-items: center;
+  padding: var(--sp-2);
+  border-radius: var(--r-1);
+  cursor: pointer;
+}
+
+.search-row.is-cursor,
+.search-row:hover {
+  background: var(--surface-hover);
+}
+
+.search-row .r-name {
+  grid-area: name;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-small);
+  color: var(--ink);
+  min-width: 0;
+}
+
+.search-row .r-name > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-row .r-meta {
+  grid-area: meta;
+  font-size: var(--fs-micro);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-row .r-dist {
+  grid-area: dist;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-tiny);
+  color: var(--ink-2);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Per-row actions appear only on the focused row, so a long list of results
+   stays a list of names rather than a wall of buttons. */
+.search-actions {
+  grid-area: dist;
+  display: none;
+  gap: var(--sp-1);
+}
+
+.search-row.is-cursor .search-actions {
+  display: flex;
+}
+
+.search-row.is-cursor .r-dist {
+  display: none;
+}
+
+.search-actions .btn {
+  font-size: var(--fs-micro);
+  padding: 1px var(--sp-2);
+}
+
+.search-empty,
+.search-hint {
+  padding: var(--sp-3);
+  font-size: var(--fs-small);
+  color: var(--dim);
+}
+
+.search-group {
+  padding: var(--sp-2) var(--sp-2) var(--sp-1);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--dim-2);
+}
+
+/* --------------------------------------------------------------- side panels */
+
+.region-right {
+  padding-top: 0;
+  padding-bottom: 0;
+  justify-content: flex-start;
+  gap: var(--sp-3);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.region-right::-webkit-scrollbar {
+  display: none;
+}
+
+.panel-dock {
+  width: calc(258px * var(--ui-scale));
+  flex: none;
+}
+
+/* On a short window the stack of docked panels can exceed the height available;
+   the region scrolls, and each panel's own body is capped so one very long panel
+   cannot push the others off-screen entirely. */
+.panel-dock .panel-body {
+  max-height: min(46vh, calc(460px * var(--ui-scale)));
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+
+.panel-caret {
+  width: 0;
+  height: 0;
+  flex: none;
+  border-left: 3.5px solid var(--dim);
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transform: rotate(90deg);
+  transition: transform var(--t-fast) var(--ease);
+}
+
+.panel.is-collapsed .panel-caret {
+  transform: none;
+}
+
+/* -------------------------------------------------------- object information */
+
+/* The name, class and action row at the top of an inspector or selection panel.
+   Shared because an object is presented the same way in both views. */
+
+.obj-head {
+  margin-bottom: var(--sp-3);
+}
+
+.obj-name {
+  margin: 0;
+  font-size: var(--fs-title);
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  line-height: 1.15;
+  color: var(--ink);
+}
+
+.obj-class {
+  margin-top: var(--sp-1);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-tiny);
+  color: var(--dim);
+}
+
+.obj-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+
+.obj-actions .btn {
+  flex: 1 1 auto;
+  justify-content: center;
+  font-size: var(--fs-tiny);
+  padding: var(--sp-1) var(--sp-2);
+}
+
+.obj-empty {
+  font-size: var(--fs-small);
+  color: var(--dim);
+  line-height: 1.5;
+}
+
+/* --------------------------------------------------------------------- time */
+
+.timebar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+}
+
+.timebar .time-date {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-small);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.timebar .time-rate {
+  font-size: var(--fs-micro);
+  color: var(--dim);
+  min-width: calc(58px * var(--ui-scale));
+  text-align: right;
+  white-space: nowrap;
+}
+
+.time-step {
+  font-family: var(--mono);
+  width: calc(24px * var(--ui-scale));
+  height: calc(22px * var(--ui-scale));
+  padding: 0;
+  justify-content: center;
+}
+
+/* ------------------------------------------------------------------ bar bits */
+
+/* Vertical hairline separating groups inside a horizontal bar. */
+.rule {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+  margin: 0 var(--sp-1);
+}
+
+.bottom-left,
+.bottom-right {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.menu button[disabled] {
+  opacity: 0.32;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------------ reticle */
+
+/*
+ * Fixed to the viewport, not to the layout grid. The centre cell of the grid is
+ * bounded by the side regions, so its middle is wherever the panels happen to
+ * leave it — which is not where the camera is pointing.
+ */
+.reticle {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  width: calc(30px * var(--ui-scale));
+  height: calc(30px * var(--ui-scale));
+  opacity: 0.5;
+  transition: opacity var(--t-mid) var(--ease);
+}
+
+/* Applied by css(node, 'is-hidden', …) wherever something is hidden for a
+   reason other than the panel it lives in being closed, so that `hidden` stays
+   free for the panel machinery to use without the two fighting each other. */
+.is-hidden {
+  display: none !important;
+}
+
+/* Four short ticks with a gap in the middle. Deliberately not a cross: an
+   unbroken crosshair reads as a weapon sight and covers the thing it points at. */
+.reticle::before,
+.reticle::after {
+  content: '';
+  position: absolute;
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.reticle::before {
+  left: 50%;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  transform: translateX(-50%);
+  /* The gap is cut with a mask rather than by using four elements. */
+  -webkit-mask-image: linear-gradient(to bottom, #000 0 26%, transparent 26% 74%, #000 74% 100%);
+  mask-image: linear-gradient(to bottom, #000 0 26%, transparent 26% 74%, #000 74% 100%);
+}
+
+.reticle::after {
+  top: 50%;
+  left: 0;
+  height: 1px;
+  width: 100%;
+  transform: translateY(-50%);
+  -webkit-mask-image: linear-gradient(to right, #000 0 26%, transparent 26% 74%, #000 74% 100%);
+  mask-image: linear-gradient(to right, #000 0 26%, transparent 26% 74%, #000 74% 100%);
+}
+
+/* --------------------------------------------------------------------- rail */
+
+/* The navigation rail is an icon strip that expands to show labels. It scrolls
+   independently and is centred vertically so it does not stretch to the full
+   height of a tall monitor. */
+.rail {
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  width: var(--rail-w);
+  max-height: 100%;
+  overflow: hidden;
+  transition: width var(--t-mid) var(--ease);
+}
+
+.rail.is-open {
+  width: var(--rail-w-open);
+}
+
+.rail-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  font: inherit;
+  font-size: var(--fs-small);
+  color: var(--dim);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-2);
+  padding: var(--sp-2);
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+}
+
+.rail-item:hover {
+  color: var(--ink);
+  background: var(--surface-hover);
+}
+
+.rail-item.is-active {
+  color: var(--accent);
+  background: var(--surface-active);
+}
+
+.rail-item .icon {
+  flex: none;
+}
+
+/* Labels are always in the DOM and only faded, so expanding the rail does not
+   reflow its contents or change the height of the strip. */
+.rail-item .rail-label {
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease);
+}
+
+.rail.is-open .rail-item .rail-label {
+  opacity: 1;
+}
+
+.rail-sep {
+  height: 1px;
+  background: var(--line);
+  margin: var(--sp-1) var(--sp-2);
+  flex: none;
+}
+
+/* ------------------------------------------------------------- help and prose */
+
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(calc(200px * var(--ui-scale)), 1fr));
+  gap: var(--sp-5);
+}
+
+.help-keys {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-small);
+  align-items: baseline;
+}
+
+.help-keys kbd,
+.help-keys button.rebind {
+  font-family: var(--mono);
+  font-size: var(--fs-tiny);
+  color: var(--accent);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  padding: 0 var(--sp-1);
+  white-space: nowrap;
+  justify-self: start;
+}
+
+.help-keys button.rebind {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: var(--fs-tiny);
+  cursor: pointer;
+}
+
+.help-keys button.rebind.is-listening {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.help-keys span {
+  color: var(--ink-2);
+}
+
+.prose {
+  font-size: var(--fs-small);
+  line-height: 1.65;
+  color: var(--ink-2);
+  margin: 0 0 var(--sp-3);
+}
+
+.prose b {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.prose.is-credits {
+  font-size: var(--fs-micro);
+  color: var(--dim);
+}
+
+/* ------------------------------------------------------------------ sections */
+
+/* Any section after the first gets a divider, whether the thing above it is
+   another section or loose content — a panel that opens with a couple of fields
+   and then starts sectioning is common, and matching only section-to-section
+   left those titles sitting on the content above them. */
+.section:not(:first-child) {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--line);
+}
+
+.section-title {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--dim-2);
+  margin-bottom: var(--sp-2);
+}
+
+/* ---------------------------------------------------------------- type badge */
+
+/* Object class, shown next to every name in search results, the inspector and
+   the context menu. Tinted by class so the kind of thing is legible before the
+   label is read. */
+.badge {
+  display: inline-block;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 1px calc(var(--sp-1) + 1px);
+  border-radius: var(--r-1);
+  border: 1px solid currentColor;
+  opacity: 0.9;
+  white-space: nowrap;
+}
+
+.badge.k-star { color: #ffd479; }
+.badge.k-planet { color: #7fd4ff; }
+.badge.k-moon { color: #b8c6d8; }
+.badge.k-asteroid { color: #c9a37a; }
+.badge.k-comet { color: #9ce8d8; }
+.badge.k-galaxy { color: #c8a6ff; }
+.badge.k-nebula { color: #ff9ec4; }
+.badge.k-cluster { color: #a8d8ff; }
+.badge.k-black-hole { color: #ff8d7a; }
+.badge.k-exo-planet { color: #86e0b0; }
+.badge.k-system { color: #9fb2c8; }
+
+/* Human-made things, in a family of their own so a spacecraft never reads as a
+   world. Warmer and greyer than the celestial badges, split by what it does. */
+.badge.k-craft,
+.badge.k-satellite { color: #8fb8d8; }
+.badge.k-station { color: #7fe0e8; }
+.badge.k-telescope { color: #a9d8ef; }
+.badge.k-orbiter { color: #9fc6e8; }
+.badge.k-probe,
+.badge.k-flyby { color: #f0b877; }
+.badge.k-rover { color: #ffb38a; }
+.badge.k-lander { color: #e0c090; }
+.badge.k-capsule { color: #ffd0a0; }
+.badge.k-stage,
+.badge.k-debris { color: #96a0aa; }
+
+/* ------------------------------------------------------------------ immersive */
+
+/* Immersive mode fades the whole interface out and stops it taking events, so a
+   screenshot has nothing in it and a drag anywhere moves the camera. Kept as
+   opacity rather than display:none so it fades rather than blinks, and so
+   nothing has to be re-laid-out when it comes back. */
+body.immersive .ui-layer,
+body.immersive .tooltip,
+body.immersive .menu,
+body.immersive .dialog,
+body.immersive .intro,
+body.immersive .label-layer {
+  opacity: 0;
+  transition: opacity var(--t-slow) var(--ease);
+}
+
+/*
+ * The descendant selector matters. `pointer-events` is not inherited in a way
+ * that a child can be held to: the layer's own children are explicitly set to
+ * `auto` so the view can be dragged through the gaps between panels, and a
+ * `none` on the ancestor alone leaves them clickable. Without this, immersive
+ * mode produces invisible panels that still swallow clicks meant for the view.
+ */
+body.immersive .ui-layer,
+body.immersive .ui-layer *,
+body.immersive .tooltip,
+body.immersive .menu,
+body.immersive .menu *,
+body.immersive .dialog,
+body.immersive .dialog *,
+body.immersive .intro,
+body.immersive .intro *,
+body.immersive .label-layer {
+  pointer-events: none !important;
+}
+
+/* ------------------------------------------------------------- flight pad */
+
+/*
+ * The on-screen free-flight controls. Sits between the readouts and the
+ * corner buttons in the bottom region, so it reads as part of the same bar
+ * rather than as a floating widget.
+ */
+.flight {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  align-items: center;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-3);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+}
+
+/* Draws the eye once, when the mode change makes the pad appear. */
+.flight.is-entering {
+  animation: flight-arrive 0.5s var(--ease);
+}
+
+@keyframes flight-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+    border-color: var(--line-2);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.flight-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+}
+
+/* Three columns, two rows: Q W E over A S D, which is where the keys are. */
+.flight-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-1);
+}
+
+.flight-key {
+  width: calc(30px * var(--ui-scale));
+  height: calc(26px * var(--ui-scale));
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: var(--fs-small);
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  cursor: pointer;
+  /* No transition on the pressed state: thrust should look instant, and a
+     fade makes a tap feel like it was not registered. */
+  transition: color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+  user-select: none;
+  -webkit-user-select: none;
+  /* Otherwise a hold on a touchscreen selects the label or scrolls the page. */
+  touch-action: none;
+}
+
+.flight-key:hover {
+  color: var(--ink);
+  border-color: var(--line-2);
+  background: var(--surface-hover);
+}
+
+/* Held, from either the button or the key it stands for. */
+.flight-key.is-down {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.flight-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  align-items: flex-start;
+}
+
+.flight-boost {
+  font-size: var(--fs-tiny);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  padding: var(--sp-1) var(--sp-3);
+  cursor: pointer;
+}
+
+.flight-boost:hover {
+  color: var(--ink-2);
+  border-color: var(--line-2);
+}
+
+.flight-boost.is-active {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.flight-speed {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.flight-speed-label {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim-2);
+}
+
+.flight-speed-range {
+  width: calc(88px * var(--ui-scale));
+  accent-color: var(--accent);
+}
+
+.flight-speed-value {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--dim);
+  /* Fixed width, or the row twitches sideways as the number changes. */
+  min-width: calc(30px * var(--ui-scale));
+  text-align: right;
+}
+
+.flight-hint {
+  font-size: var(--fs-micro);
+  color: var(--dim-2);
+  letter-spacing: 0.04em;
+  text-align: center;
+}
+
+.flight-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.9em;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim-2);
+}
+
+.flight-readout[hidden] {
+  display: none;
+}
+
+.flight-readout-label {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--dim-3, var(--dim-2));
+}
+
+.flight-readout-speed {
+  color: var(--text, #fff);
+  min-width: 6.5em;
+  text-align: right;
+}
+
+/* The pad is a hand-sized target and the first thing to go when there is no
+   room; the keys still work, and the hint in the tooltip still says so. */
+@media (max-width: 900px) {
+  .flight-hint,
+  .flight-speed-label {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------- first run
+
+   The one panel that is allowed to sit in the middle of the scene and take the
+   pointer, because on a first visit there is nothing behind it worth seeing
+   yet, and because everything it says stops applying the moment it is read. */
+.intro {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  /* Deliberately not a modal. It began as one, with a full-screen scrim over
+     the pointer, and that was wrong twice: it dimmed the scene on the one visit
+     where the scene is doing the persuading, and it swallowed every click and
+     drag until dismissed — so the card telling you to drag to look around was
+     the thing stopping you. Only the card itself takes the pointer; the sky
+     behind it stays live, and anyone who would rather just fly can. */
+  pointer-events: none;
+}
+
+.intro[hidden] {
+  display: none;
+}
+
+.intro-card {
+  /* The fade belongs on the card and not on `.intro`, which has to keep an
+     opacity the cascade can still reach: an animation with a fill of `both`
+     beats a normal declaration, so animating the container left it permanently
+     at full opacity and immersive mode could not put it away. Every capture
+     script hides the interface and measures pixels, so the card sat in the
+     middle of the frame and was measured as part of the planet. */
+  animation: intro-in var(--t-slow) var(--ease) both;
+  pointer-events: auto;
+  width: min(520px, calc(100vw - 2 * var(--sp-4)));
+  padding: var(--sp-5);
+  /* Opaque enough to read over a sunlit planet, since it can now sit over one. */
+  background: linear-gradient(rgba(9, 12, 20, 0.94), rgba(6, 8, 14, 0.96));
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-3);
+  backdrop-filter: blur(var(--blur));
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+}
+
+.intro-title {
+  font-size: var(--fs-title);
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+
+.intro-sub {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-small);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.intro-steps {
+  margin: var(--sp-5) 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: var(--sp-4);
+}
+
+.intro-step {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-3);
+  align-items: start;
+}
+
+.intro-step-n {
+  display: grid;
+  place-items: center;
+  width: 1.55em;
+  height: 1.55em;
+  border-radius: 50%;
+  border: 1px solid var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: var(--fs-tiny);
+}
+
+.intro-step-name {
+  font-size: var(--fs-small);
+  color: var(--ink);
+}
+
+.intro-step-body {
+  margin-top: 2px;
+  font-size: var(--fs-tiny);
+  line-height: 1.55;
+  color: var(--dim);
+}
+
+.intro-actions {
+  margin-top: var(--sp-5);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/* The one call to action that should be unmistakable, since the whole point of
+   the card is that the first move is not obvious. */
+.btn.is-primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.btn.is-primary:hover {
+  background: var(--accent);
+}
+
+@keyframes intro-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.immersive-hint {
+  position: fixed;
+  left: 50%;
+  /* Clear of the home indicator, which sits exactly here and would otherwise be
+     drawn straight through the one line of text telling you how to get out. */
+  bottom: calc(var(--sp-5) + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  z-index: 60;
+  font-size: var(--fs-tiny);
+  color: var(--dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  pointer-events: none;
+  opacity: 0;
+  /* No delay on the way out: leaving immersive mode should take the hint with it
+     immediately. The delay that lets the hint linger long enough to be read is on
+     the immersive rule above, which is the transition into that state. */
+  transition: opacity var(--t-fast) var(--ease);
+}
+
+body.immersive .immersive-hint {
+  /* Visible on arrival, then fades itself so it is not in the screenshot it
+     exists to enable. */
+  animation: hint-linger 5s var(--ease) forwards;
+}
+
+@keyframes hint-linger {
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  60% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/*
+ * On a touch device the hint is the way out rather than a note about it.
+ *
+ * Immersive mode is entered by a button and left by F11, and a phone has no F
+ * keys — so the mode was a trap: everything that could restore the interface had
+ * just been faded out and made unclickable. The way out has to be something
+ * still on screen, which means the hint cannot fade to nothing the way it does
+ * on a desktop, where it fades precisely so it stays out of the screenshot the
+ * mode exists to enable. A quarter of an opacity is the compromise: legible
+ * enough to find, faint enough to ignore. explorer-ui.js adds the class and
+ * makes it tappable; see the immersive section there.
+ */
+body.immersive .immersive-hint.is-touch {
+  animation: hint-settle 5s var(--ease) forwards;
+  pointer-events: auto;
+  /* Comfortably tappable rather than a one-line strip of small caps. */
+  padding: var(--sp-2) var(--sp-5);
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-1);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+}
+
+@keyframes hint-settle {
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  60% { opacity: 1; }
+  100% { opacity: 0.26; }
+}
+
+/*
+ * Both spellings of the hint, silenced.
+ *
+ * Set when the interface was hidden programmatically rather than by somebody
+ * pressing the button — see setImmersive in ui/explorer-ui.js for why a capture
+ * script must not be handed this. Last of the three on purpose: it has the same
+ * specificity as the touch rule above and has to win.
+ */
+body.immersive .immersive-hint.is-silent,
+body.immersive .immersive-hint.is-touch.is-silent {
+  animation: none;
+  opacity: 0;
+  /* The touch rule makes the hint the way out of immersive mode, and an
+     invisible way out is a trap for anything still clicking around. */
+  pointer-events: none;
+}
+
+/* -------------------------------------------------------------------- loading */
+
+#loading {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle at 50% 45%, #0a1020 0%, var(--void) 72%);
+  z-index: 100;
+  transition: opacity var(--t-slow) var(--ease);
+}
+
+/* Both spellings: the explorer sets `is-done`, the planetarium's loader sets
+   `done`. Cheaper to accept both here than to have the two apps disagree. */
+#loading.is-done,
+#loading.done {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.loading-title {
+  font-family: var(--mono);
+  letter-spacing: 0.52em;
+  font-size: var(--fs-large);
+  text-align: center;
+  color: var(--ink);
+}
+
+.loading-sub {
+  margin-top: var(--sp-4);
+  font-size: var(--fs-small);
+  color: var(--dim);
+  text-align: center;
+}
+
+.loading-bar {
+  margin-top: var(--sp-4);
+  width: calc(220px * var(--ui-scale));
+  height: 2px;
+  background: rgba(140, 175, 215, 0.18);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.loading-bar > div {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width var(--t-mid) var(--ease);
+}
+
+/* ----------------------------------------------------------------- touch
+
+   Everything that has to grow because it is being pressed with a finger rather
+   than pointed at with a cursor, on any size of touch screen.
+
+   Split from the width tiers below on purpose. An iPad is a thousand points
+   across and its buttons need to be exactly as big as a phone's; a desktop
+   window dragged down to phone width is still being driven by a mouse and
+   should keep the compact controls the interface was designed with. Those are
+   two separate questions, and asking them both with a width gets one of them
+   wrong whichever answer you pick. The class comes from platform.js by way of
+   ui/explorer-ui.js and src/controls.js, so it can never appear on a desktop.
+
+   44 points is Apple's floor and it is a real one: this interface is
+   deliberately small, because it is an instrument laid over a view and every
+   pixel it takes is a pixel of universe, and at 24 points its icon buttons are
+   half a fingertip. They are grown with a minimum size rather than by turning up
+   --ui-scale, which would inflate the type and the panels along with them and
+   give back less scene than the targets gained. */
+
+html.is-touch {
+  /* The rail's items are its width less its padding, so a 42-point rail gives
+     28-point items — for the strip that opens every panel in the app. */
+  --rail-w: calc(56px * var(--ui-scale));
+}
+
+html.is-touch .region-top .btn,
+html.is-touch .region-bottom .btn,
+html.is-touch .dialog .btn,
+html.is-touch .intro-actions .btn,
+html.is-touch .segmented button,
+html.is-touch .rail-item,
+html.is-touch .time-step {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+html.is-touch .region-top .btn.is-icon,
+html.is-touch .region-bottom .btn.is-icon,
+html.is-touch .dialog .btn.is-icon {
+  width: 44px;
+  height: 44px;
+}
+
+/* A result row is a name over a class in nine-point type, which comes to 34
+   points of a list you are meant to hit exactly one item of. */
+html.is-touch .search-row {
+  min-height: 44px;
+}
+
+/* The row is already 44 points tall, so the buttons in it can have all of that
+   height for nothing. */
+html.is-touch .search-actions .btn {
+  min-height: 44px;
+  padding: 0 var(--sp-2);
+}
+
+/* Eleven rail items at 44 points are taller than a phone on its side, and the
+   rail clips rather than scrolls — which would leave the last few panels with
+   no way to reach them at all. The scrollbar is hidden to match the docks. */
+html.is-touch .rail {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+html.is-touch .rail::-webkit-scrollbar {
+  display: none;
+}
+
+/* Hand-sized keycaps. The pad is the one control here that is held rather than
+   pressed, so it gets a little more than the minimum in the axis it is held
+   in, and the tightest gaps that still read as separate keys. */
+html.is-touch .flight-key {
+  width: 44px;
+  height: 46px;
+}
+
+html.is-touch .flight-pad {
+  gap: var(--sp-2);
+}
+
+html.is-touch .flight-row {
+  gap: var(--sp-4);
+}
+
+html.is-touch .flight-boost {
+  min-height: 44px;
+  padding: var(--sp-1) var(--sp-4);
+}
+
+html.is-touch .flight-speed-range {
+  /* A four-point track is a mouse target. */
+  height: 28px;
+}
+
+/*
+ * Put back the line the 900-point rule above drops. That rule trades the hint
+ * for room on the assumption that hovering a key gives the same answer in more
+ * detail, and on a touch screen there is no hover: dropping it leaves a pad of
+ * six unexplained letters as the only way to fly without a keyboard. It is the
+ * cheapest twelve points on the screen, and it is bought back at every touch
+ * width rather than only on a phone held upright — a phone on its side is 844
+ * points wide and would otherwise fall through the gap.
+ */
+html.is-touch .flight-hint {
+  display: block;
+  max-width: 100%;
+}
+
+/*
+ * A phone on its side is 390 points tall, and the pad is the tallest thing at
+ * the bottom of it. Tightened here so its top edge stays out of the middle of
+ * the frame: the padding and the gaps between the keys give up a few points
+ * each, and the keys themselves — the part being aimed at — do not.
+ */
+@media (max-height: 480px) {
+  html.is-touch .flight {
+    padding: var(--sp-2) var(--sp-3);
+    gap: var(--sp-1);
+  }
+
+  html.is-touch .flight-pad {
+    gap: 2px;
+  }
+
+  html.is-touch .flight-key {
+    height: 44px;
+  }
+}
+
+/*
+ * A touch rail is fourteen points wider than a pointer one, and on a portrait
+ * iPad that is fourteen points further into the middle of the view — where an
+ * open panel beside it was already a little too close. Taken back off the panel,
+ * which at 258 points has it to give. Above 1180 there is room for both; below
+ * 481 the phone tier has its own answer, which is why this sits between them.
+ */
+@media (min-width: 481px) and (max-width: 1180px) {
+  html.is-touch .panel-dock {
+    width: calc(200px * var(--ui-scale));
+  }
+}
+
+/* ------------------------------------------------------------- responsive */
+
+/*
+ * The layout is fluid, but a few things have to change rather than shrink.
+ * Panels are a fixed width so text stays readable; what gives way is how many
+ * of them are on screen at once.
+ */
+
+/*
+ * Ultrawide: draw the panels in from the far edges, where on a 21:9 monitor they
+ * sit outside comfortable vision.
+ *
+ * The inset is capped at 22vw minus the width of the dock, not simply at half the
+ * excess over some ideal width. Centring on a nominal width overshoots badly as
+ * the monitor gets wider — at 3440 it walks the panels into the middle of the
+ * view, which is the one thing the layout exists to prevent.
+ */
+/*
+ * A phone on its side is 2.16:1, so this query catches one — and the inset it
+ * computes there is negative, falling back to the plain edge and quietly
+ * throwing away the safe area the regions had. Hence the max() against the
+ * per-side edge on each: on a monitor the inset is the larger of the two and
+ * these are exactly the rules that were here before, and in landscape on a
+ * phone the notch still gets its 44 points.
+ */
+@media (min-aspect-ratio: 2/1) {
+  :root { --inset: max(var(--edge), min(calc((100vw - 2100px) / 2), calc(22vw - 320px))); }
+  .region-left { padding-left: max(var(--edge-left), var(--inset)); }
+  .region-right { padding-right: max(var(--edge-right), var(--inset)); }
+  .region-top,
+  .region-bottom {
+    padding-left: max(var(--edge-left), var(--inset));
+    padding-right: max(var(--edge-right), var(--inset));
+  }
+}
+
+/* Short windows: the right-hand stack gets less room, so cap each panel harder
+   and let the region scroll. */
+@media (max-height: 780px) {
+  .panel-dock .panel-body { max-height: 34vh; }
+}
+
+@media (max-width: 1180px) {
+  .brand-sub { display: none; }
+}
+
+@media (max-width: 980px) {
+  .search { flex-basis: calc(210px * var(--ui-scale)); }
+}
+
+@media (max-width: 820px) {
+  .panel-dock { width: calc(216px * var(--ui-scale)); }
+  .brand-name { display: none; }
+}
+
+/* Narrow enough that side panels and the view cannot coexist. The rail stays,
+   because it is how the panels are summoned back. */
+/* The labelled rail and an open panel beside it need about 435px of the left
+   edge. Below roughly 1560px wide that is more than the frame can give before
+   the panel starts sitting over the middle of the view — over the thing you
+   came to look at — so the rail goes back to icons and earns its width back.
+   The labels are still one hover or one click of the toggle away, and the
+   welcome card and the guide both name the panels in words regardless. */
+@media (max-width: 1560px) {
+  /* Matching the specificity of the .rail.is-open rules above, and after them,
+     so these win: a plain `.rail` selector loses to `.rail.is-open` no matter
+     which media query it sits in. */
+  .rail.is-open { width: var(--rail-w); }
+  .rail.is-open .rail-item .rail-label { opacity: 0; }
+}
+
+/* There is no right-hand column to give the right region at this width, so it is
+   laid over the middle row instead. Hiding it would leave Object, Planetary
+   system and Bookmarks lighting up in the rail and opening nothing. */
+@media (max-width: 680px) {
+  .region-right {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-self: end;
+    justify-content: flex-end;
+    padding-bottom: var(--sp-2);
+  }
+  .region-right > .dock { max-height: 46vh; }
+  .rail { width: var(--rail-w) !important; }
+  .rail .rail-label { display: none; }
+  .region-bottom { justify-content: center; }
+}
+
+/* ------------------------------------------------------------------ phone
+
+   The tiers above narrow a window; this one is a different shape of screen.
+
+   An iPhone is 390 to 440 CSS pixels across and about 850 tall, which is under
+   two thirds of the narrowest tier the layout had and half again as tall as it
+   is wide. Nothing above it copes, because everything above it assumes the top
+   bar's five groups fit on one row and that a hand-sized control can be 24
+   pixels across. Both stop being true here, so this tier is about stacking
+   rather than shrinking, and about growing the things you press.
+
+   Sizing is not this tier's job — that is the touch block above, which applies
+   at every screen size. What is here is only where things go.
+
+   The rule the layout exists to enforce still holds: the middle of the screen
+   belongs to the view. Everything below is pinned to the top edge or the bottom
+   edge, and the two are kept far enough apart that the scene has the band
+   between them to itself. */
+@media (max-width: 480px) {
+  /*
+   * The top bar's groups — a rail toggle, a wordmark, search, a mode toggle in
+   * the planetarium, and a clock carrying a full date — fit across one row at
+   * desktop widths with room to spare. Here they do not fit at all, so they
+   * stack, and the wordmark goes: it names an app you are already inside, and
+   * it is the only thing in the bar that does not do anything.
+   */
+  .topbar {
+    flex-wrap: wrap;
+    row-gap: var(--sp-2);
+  }
+
+  .brand,
+  .topbar-spacer {
+    display: none;
+  }
+
+  /* Search shares the first row with the rail toggle, because it is the fastest
+     route to anywhere and the rail is how everything else is reached. */
+  .search {
+    order: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  /* Results are as wide as the field rather than the 420px they want, which is
+     wider than the screen. */
+  .search-results {
+    width: auto;
+    left: 0;
+    right: 0;
+    max-width: none;
+  }
+
+  .topbar > .segmented {
+    order: 2;
+  }
+
+  /*
+   * The clock takes a row of the bar to itself, and then splits into two of its
+   * own: the transport above, the timestamp below.
+   *
+   * Its eight controls plus a nineteen-character date come to well over five
+   * hundred points and there is no arrangement of them that fits across 366, so
+   * it was always going to wrap — the only question is where. Left to itself it
+   * breaks after the date and leaves "now" and a multiplier button stranded on a
+   * second line looking like an accident. Breaking before the date instead gives
+   * two rows that each mean something, which is what a clock on a phone looks
+   * like anyway.
+   */
+  .topbar > .timebar {
+    order: 3;
+    flex: 1 1 100%;
+    justify-content: center;
+    flex-wrap: wrap;
+    row-gap: var(--sp-1);
+  }
+
+  .topbar > .timebar .time-date {
+    flex: 1 1 100%;
+    font-size: var(--fs-micro);
+    text-align: center;
+  }
+
+  /* It separated the rate from the date, which are no longer beside each other. */
+  .topbar > .timebar .rule {
+    display: none;
+  }
+
+  .region-top {
+    padding-bottom: var(--sp-2);
+  }
+
+  /*
+   * A docked panel cannot avoid covering the view on a screen this narrow:
+   * the panel is 216 points wide, the rail is another 44, and the screen is
+   * 390. So the choice is only where it covers, and the answer is low and to
+   * the left — anchored to the bottom of its region and capped in height, which
+   * leaves the upper half of the scene and the right-hand side of it visible
+   * while a panel is open, and the whole of it visible when none is. The width
+   * cap is the more important half of this rule: without it the panel runs off
+   * the side of the screen and its right-hand column of numbers is unreachable.
+   */
+  .region-left {
+    align-items: flex-end;
+    padding-bottom: var(--sp-2);
+  }
+
+  .region-left > .dock {
+    max-height: 46vh;
+  }
+
+  .panel-dock {
+    width: min(
+      calc(216px * var(--ui-scale)),
+      calc(100vw - var(--rail-w) - var(--edge-left) - var(--edge-right) - var(--sp-3))
+    );
+  }
+
+  /*
+   * The bottom bar stacks, in a fixed order, and the flight pad is last so it
+   * is the lowest thing on the screen. That is not a tidiness preference: the
+   * pad is the only way to fly without a keyboard, it is held with a thumb, and
+   * a thumb reaches the bottom of a phone far more comfortably than the middle
+   * of it. The readouts it changes stay directly above it, and the two corner
+   * buttons keep their row so the pad gets a full-width one to itself.
+   */
+  .region-bottom {
+    justify-content: center;
+    row-gap: var(--sp-2);
+    padding-top: var(--sp-2);
+  }
+
+  .region-bottom .hud {
+    order: 1;
+    flex: 1 1 auto;
+  }
+
+  .region-bottom .bottom-right {
+    order: 2;
+    flex: none;
+  }
+
+  .region-bottom .flight {
+    order: 3;
+    flex: 1 1 100%;
+  }
+
+  /* The pad and its throttle spread across the row rather than sitting in the
+     middle of it, since the row is now the width of the screen. */
+  .flight-row {
+    width: 100%;
+    justify-content: space-around;
+  }
+
+  .flight-speed-range {
+    width: calc(72px * var(--ui-scale));
+  }
+
+  /* The first-run card is the full width of the screen less its margins here,
+     and its actions stack rather than being squeezed onto one line. */
+  .intro-card {
+    width: calc(100vw - var(--edge-left) - var(--edge-right));
+    padding: var(--sp-4);
+  }
+
+  /* Two columns of help text in 366 points is two columns of one word. */
+  .help-grid {
+    grid-template-columns: 1fr;
+    gap: var(--sp-4);
+  }
+
+  .intro-actions .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+}

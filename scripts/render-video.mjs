@@ -1,0 +1,1431 @@
+/**
+ * Render a shot to a finished, uploadable video.
+ *
+ * Screen recording a flight gives you whatever the machine managed that day:
+ * dropped frames, terrain popping in late, the quality governor dipping detail
+ * when the fan spins up. None of that is fixable afterwards. So nothing here is
+ * recorded — the camera is placed frame by frame, and each frame is held until
+ * the terrain has finished streaming before it is captured. A frame takes as
+ * long as it takes, real time means nothing, and the result is identical on any
+ * machine and re-renderable at any resolution.
+ *
+ * The score comes from the app's own synthesiser through an OfflineAudioContext,
+ * the same way scripts/audition.mjs renders it. That matters for a channel: it
+ * is generated, so there is no third-party recording to be claimed, muted or
+ * demonetised on upload.
+ *
+ * Captions are drawn into the page rather than burned in by ffmpeg, so they use
+ * the app's own typeface and need no filter support in the encoder. A matching
+ * .srt is written alongside for the upload's caption track.
+ *
+ * Usage: node scripts/render-video.mjs [shot]
+ *        node scripts/render-video.mjs moon --preview
+ *        node scripts/render-video.mjs moon --landscape
+ *        node scripts/render-video.mjs moon --fps 60 --width 2160 --height 3840
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import ffmpegPath from 'ffmpeg-static';
+import puppeteer from 'puppeteer-core';
+
+const URL = process.env.COSMINOVA_URL ?? 'http://127.0.0.1:5179/';
+const CHROME = process.env.CHROME_PATH
+  ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+const args = process.argv.slice(2);
+const flag = (name) => {
+  const i = args.indexOf(`--${name}`);
+  if (i < 0) return false;
+  args.splice(i, 1);
+  return true;
+};
+const option = (name, fallback) => {
+  const i = args.indexOf(`--${name}`);
+  if (i < 0) return fallback;
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+};
+
+const PREVIEW = flag('preview');
+const LANDSCAPE = flag('landscape');
+const KEEP = flag('keep-frames');
+const FPS = Number(option('fps', PREVIEW ? 12 : 30));
+const WIDTH = Number(option('width', LANDSCAPE ? 1920 : 1080)) / (PREVIEW ? 2 : 1);
+const HEIGHT = Number(option('height', LANDSCAPE ? 1080 : 1920)) / (PREVIEW ? 2 : 1);
+// No mark on the picture by default. A caption says something; a logo sitting
+// over the frame for the whole runtime only asks for something.
+const BRAND = option('brand', '');
+const SITE = option('url', '');
+// A slice of the frames, [FROM, TO), for splitting one shot across machines.
+// A sliced run writes its frames and stops; joining them is the caller's job.
+const FROM = Number(option('from', 0));
+const TO = Number(option('to', Infinity));
+const SLICED = FROM > 0 || Number.isFinite(TO);
+const COUNT = flag('count');
+const SHOT_NAME = args[0] ?? 'moon';
+
+const OUT_DIR = path.resolve('video');
+const FRAME_DIR = path.join(OUT_DIR, `${SHOT_NAME}-frames`);
+
+// ---------------------------------------------------------------------------
+// Easing and interpolation
+// ---------------------------------------------------------------------------
+
+/**
+ * Easing that does not stop in the middle of the shot.
+ *
+ * Easing each beat in and out independently brings the camera to a dead halt at
+ * every boundary, which in a shot whose whole claim is that it never cuts reads
+ * as five stalls. So only the two ends of the whole move are eased, and the
+ * joins in between are left alone: `depart` leaves from rest and arrives at
+ * unit rate, `arrive` leaves at unit rate and comes to rest, and everything
+ * between them runs on a linear clock.
+ *
+ * A linear clock is the right one because distances and fields of view travel
+ * geometrically — constant ratio per second, which is what reads as a smooth
+ * continuous zoom rather than something accelerating away.
+ */
+const depart = (t) => 2 * t * t - t * t * t;
+const arrive = (t) => t + t * t - t * t * t;
+const linear = (t) => t;
+const lerp = (a, b, t) => a + (b - a) * t;
+/** Distances and fields of view are ratios, so they travel geometrically. */
+const glide = (a, b, t) => a * Math.pow(b / a, t);
+/** Turn the short way round, so a sweep never takes the long way to get there. */
+const wrapTo = (from, to) => {
+  let d = (to - from) % (2 * Math.PI);
+  if (d > Math.PI) d -= 2 * Math.PI;
+  if (d < -Math.PI) d += 2 * Math.PI;
+  return from + d;
+};
+
+// ---------------------------------------------------------------------------
+// The shot
+// ---------------------------------------------------------------------------
+
+const MOON_RADIUS_KM = 1737.4;
+
+/**
+ * Earth's surface to the floor of a lunar crater, in one continuous move.
+ *
+ * The join in the middle is the interesting part. Magnifying from the ground and
+ * flying there are different things, and cutting between them wastes the only
+ * claim this engine has that a video editor cannot fake — that it is all one
+ * scene at true scale. So instead the field of view opens back up over a second
+ * and a half while the distance closes by exactly the same ratio: the Moon
+ * holds its size on screen while the perspective changes underneath it, and a
+ * flat magnified disc becomes a sphere you are approaching without a cut.
+ */
+const SHOTS = {
+  moon: {
+    // A waning crescent, about a third lit, on a dark sky. Measured from the
+    // ground rather than from orbit, which is the only place the phase means
+    // anything — and picked away from new moon, where the Moon rides close
+    // enough to the Sun that the sky is brighter than the disc.
+    date: '2026-09-07T06:00:00.000Z',
+    beats: [
+      {
+        name: 'reveal',
+        seconds: 3.5,
+        ease: depart,
+        caption: 'This is the Moon, from Earth.',
+        // Opening on the wide naked-eye sky was three seconds of black with a
+        // speck in it — true to what you see standing outside, and fatal in a
+        // format where the first frame decides whether anyone sees the second.
+        // So it opens already magnified, on a disc with its maria visible.
+        async setup(page) {
+          await page.evaluate(() => {
+            window.cosminova.target('moon', 3.2);
+            window.cosminova.viewFromEarth(true);
+          });
+        },
+        frame: (t) => ({ fov: glide(2.0, 1.45, t), lookPitch: 0 }),
+      },
+      {
+        name: 'magnify',
+        seconds: 4.5,
+        ease: linear,
+        caption: 'No cuts. No CGI. Real data.',
+        // Down to where the disc nearly fills the frame. Past this, magnifying
+        // stops paying: the field is already narrower than the Moon.
+        frame: (t) => ({ fov: glide(1.45, 0.74, t), lookPitch: 0 }),
+      },
+      {
+        name: 'handover',
+        seconds: 3,
+        ease: linear,
+        caption: '384,400 km — crossed for real.',
+        async setup(page, ctx) {
+          // Leave the ground holding the same look direction, so the phase and
+          // the terminator carry across the join untouched.
+          ctx.base = await page.evaluate((radius) => {
+            const sv = window.cosminova;
+            sv.viewFromEarth(false);
+            const c = sv.controls;
+            c.stopFlight();
+            return { yaw: c.yaw, pitch: c.pitch, distanceRadii: c.distanceRadii, radius };
+          }, MOON_RADIUS_KM);
+        },
+        frame: (t, ctx) => ({
+          // Both move by the same ratio, which is what holds the apparent size.
+          fov: glide(0.74, 40, t),
+          distanceRadii: glide(ctx.base.distanceRadii, 4.1, t),
+          yaw: ctx.base.yaw,
+          pitch: ctx.base.pitch,
+        }),
+      },
+      {
+        name: 'orbit',
+        seconds: 7,
+        ease: linear,
+        caption: 'Real elevation, measured from orbit.',
+        /**
+         * Swing round onto the lit side while closing in.
+         *
+         * A crescent seen from Earth is a crescent all the way there, so
+         * arriving and staying put would put the camera over four fifths
+         * darkness and land the descent in the dark. Rather than guess a
+         * direction, the app is asked where a fifty-degree phase angle is for
+         * this date and the sweep ends there: a strong terminator and long
+         * shadows, whatever the phase happened to be at the start.
+         */
+        async setup(page, ctx) {
+          // Two directions, not one: where a fifty-degree phase is, to arrive
+          // on, and a slightly more raking one to descend towards, because low
+          // sun is what puts shadows in a crater and shadows are the only
+          // reason the relief reads at all.
+          //
+          // Both are asked for rather than reached by drifting a hand-picked
+          // yaw, which turns the camera whichever way the arithmetic happens to
+          // point — on this date, into the terminator, so the shot got murkier
+          // every second and ended on a frame you cannot see. The opposite
+          // mistake is just as easy: aiming at thirty-two degrees put the sun
+          // overhead and washed the last five seconds out flat.
+          const sample = (phase) => page.evaluate((p) => {
+            const sv = window.cosminova;
+            sv.lookFromSun('moon', 4.1, p, 14);
+            return { yaw: sv.controls.yaw, pitch: sv.controls.pitch };
+          }, phase);
+          ctx.lit = await sample(50);
+          ctx.litClose = await sample(56);
+          ctx.lit.yaw = wrapTo(ctx.base.yaw, ctx.lit.yaw);
+          ctx.litClose.yaw = wrapTo(ctx.lit.yaw, ctx.litClose.yaw);
+        },
+        frame: (t, ctx) => ({
+          fov: 40,
+          distanceRadii: glide(4.1, 2.05, t),
+          yaw: lerp(ctx.base.yaw, ctx.lit.yaw, t),
+          pitch: lerp(ctx.base.pitch, ctx.lit.pitch, t),
+        }),
+      },
+      {
+        name: 'descend',
+        seconds: 8,
+        ease: arrive,
+        caption: 'All the way down to the ground.',
+        frame: (t, ctx) => ({
+          fov: lerp(40, 55, t),
+          // 2.05 radii out to about three kilometres up.
+          distanceRadii: glide(2.05, 1.0018, t),
+          yaw: lerp(ctx.lit.yaw, ctx.litClose.yaw, t),
+          pitch: lerp(ctx.lit.pitch, ctx.litClose.pitch, t),
+        }),
+      },
+    ],
+  },
+};
+
+/**
+ * Sunsets, on six worlds and around three stars.
+ *
+ * Every frame is the sky the scattering equations give for that world's air and
+ * that star's colour, seen from a camera standing at a stated height with the
+ * sun at a stated angle above the horizon. Nothing is graded to look alien: the
+ * red skies are red because the star is 2500 K, and Mars's blue sunset is blue
+ * because that is what happens when the air is thin enough that the forward
+ * lobe beats the sideways one.
+ */
+SHOTS.alien = {
+  date: '2026-06-21T17:00:00.000Z',
+  beats: [
+    {
+      name: 'earth-day',
+      seconds: 5,
+      ease: depart,
+      caption: 'Sunset is just air in the way.',
+      async setup(page) {
+        // Stood on the spot first, so the terrain and textures stream in for
+        // where the camera will actually be rather than for wherever the app
+        // happened to be pointing.
+        await page.evaluate(() => {
+          window.cosminova.standAt('earth', { sunElevationDeg: 12, altitudeKm: 2.5, viewElevationDeg: 9 });
+        });
+        await page.evaluate(() => window.cosminova.loadDetail('earth'));
+      },
+      frame: (t) => ({
+        stand: {
+          body: 'earth',
+          sunElevationDeg: lerp(12, 3, t),
+          altitudeKm: 2.5,
+          viewElevationDeg: 9,
+          fov: 62,
+        },
+      }),
+    },
+    {
+      name: 'earth-set',
+      seconds: 5,
+      ease: linear,
+      caption: 'Blue light scatters away first. Red is what gets through.',
+      frame: (t) => ({
+        stand: {
+          body: 'earth',
+          sunElevationDeg: lerp(3, -1.5, t),
+          altitudeKm: 2.5,
+          viewElevationDeg: 9,
+          fov: 62,
+        },
+      }),
+    },
+    {
+      name: 'earth-dusk',
+      seconds: 3.5,
+      ease: linear,
+      caption: 'Then the planet\u2019s own shadow climbs the sky.',
+      // Stopping at three degrees below rather than six: past that the band is
+      // all there is to see and the frame is otherwise black.
+      frame: (t) => ({
+        stand: {
+          body: 'earth',
+          sunElevationDeg: lerp(-1.5, -3.2, t),
+          altitudeKm: 2.5,
+          viewElevationDeg: 5,
+          fov: 55,
+        },
+      }),
+    },
+    {
+      name: 'mars',
+      seconds: 6,
+      ease: linear,
+      caption: 'Mars. Same star — and the sunset comes out blue.',
+      async setup(page) {
+        await page.evaluate(() => {
+          window.cosminova.standAt('mars', { sunElevationDeg: 5, altitudeKm: 4, viewElevationDeg: 8 });
+        });
+        await page.evaluate(() => window.cosminova.loadDetail('mars'));
+      },
+      frame: (t) => ({
+        stand: {
+          body: 'mars',
+          sunElevationDeg: lerp(5, -1, t),
+          altitudeKm: 4,
+          viewElevationDeg: 8,
+          fov: 62,
+        },
+      }),
+    },
+    {
+      name: 'trappist',
+      seconds: 7,
+      ease: linear,
+      caption: 'TRAPPIST-1 e. Its sun is a red dwarf, four times wider than ours.',
+      async setup(page, ctx) {
+        // The system is fetched and built on demand, so it has to be asked for
+        // and waited on before there is a surface to stand on.
+        await page.evaluate(() => window.cosminova.target('exo:trappist-1-e'));
+        await page.waitForFunction(
+          () => Boolean(window.cosminova.standAt('exo:trappist-1-e', { sunElevationDeg: 6, altitudeKm: 10 })),
+          { timeout: 90000 },
+        );
+        await page.evaluate(() => window.cosminova.loadDetail('trappist-1-e'));
+      },
+      frame: (t) => ({
+        stand: {
+          body: 'exo:trappist-1-e',
+          sunElevationDeg: lerp(6, -0.5, t),
+          altitudeKm: 10,
+          viewElevationDeg: 10,
+          fov: 62,
+        },
+      }),
+    },
+    {
+      name: 'proxima',
+      seconds: 5.5,
+      ease: linear,
+      caption: 'Proxima b, four light years out. The closest sunset to home.',
+      async setup(page, ctx) {
+        await page.evaluate(() => window.cosminova.target('exo:proxima-cen-b'));
+        await page.waitForFunction(
+          () => Boolean(window.cosminova.standAt('exo:proxima-cen-b', { sunElevationDeg: 4, altitudeKm: 10 })),
+          { timeout: 90000 },
+        );
+        await page.evaluate(() => window.cosminova.loadDetail('proxima-cen-b'));
+      },
+      frame: (t) => ({
+        stand: {
+          body: 'exo:proxima-cen-b',
+          sunElevationDeg: lerp(4, -0.5, t),
+          altitudeKm: 10,
+          viewElevationDeg: 10,
+          fov: 62,
+        },
+      }),
+    },
+    // Two frames of the same composition, because that is what makes the
+    // comparison legible. Held at one absolute distance instead, the honest
+    // frame is a supergiant filling the screen next to a sun two pixels across:
+    // true, and unreadable. So the apparent size is what is held fixed, and the
+    // distance it took to get there is the number that carries the scale.
+    {
+      name: 'sun-scale',
+      seconds: 4,
+      ease: linear,
+      caption: 'This is our sun, from eight times its own radius.',
+      async setup(page) {
+        await page.evaluate(() => {
+          const sv = window.cosminova;
+          sv.target('sun', 8);
+          sv.controls.stopFlight();
+          sv.controls.distanceRadii = 8;
+        });
+      },
+      frame: () => ({ distanceRadii: 8, fov: 34 }),
+    },
+    {
+      name: 'betelgeuse',
+      seconds: 6,
+      ease: linear,
+      caption: 'Betelgeuse, the same size on screen \u2014 from 700 times as far.',
+      async setup(page) {
+        await page.evaluate(() => {
+          const sv = window.cosminova;
+          sv.target('star:Betelgeuse', 8);
+          sv.controls.stopFlight();
+          sv.controls.distanceRadii = 8;
+        });
+      },
+      frame: (t) => ({ distanceRadii: glide(8, 6.4, t), fov: 34 }),
+    },
+    {
+      name: 'betelgeuse-orbit',
+      seconds: 4,
+      ease: linear,
+      // Its radius comes out at 712 solar radii here, which is 3.3 AU: past
+      // Mars at 1.52, and most of the way to the asteroid belt.
+      caption: 'Put it where the sun is, and Mars would orbit inside it.',
+      frame: (t) => ({ distanceRadii: glide(6.4, 5.2, t), fov: 34 }),
+    },
+    {
+      name: 'hole-far',
+      seconds: 5,
+      ease: linear,
+      caption: 'Sagittarius A*. Four million suns, in a point.',
+      async setup(page) {
+        await page.evaluate(() => {
+          const sv = window.cosminova;
+          sv.setView('blackHoles', true);
+          sv.lookAtBlackHole('sgr-a', 260);
+        });
+      },
+      frame: (t) => ({
+        distanceRadii: glide(260, 110, t),
+        fov: 38,
+      }),
+    },
+    {
+      name: 'hole-near',
+      seconds: 7,
+      ease: arrive,
+      caption: 'The ring is light from behind it, bent around the front.',
+      frame: (t) => ({
+        distanceRadii: glide(110, 24, t),
+        fov: lerp(38, 52, t),
+      }),
+    },
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// Shorts: hook, demonstration, payoff, invitation. Short lines, readable muted.
+// ---------------------------------------------------------------------------
+
+const END_CAPTION = 'Explore it in Cosminova\nLink in description';
+/** Hold wherever the previous beat ended, with the invitation over it. */
+const endCard = (seconds = 3.5) => ({
+  name: 'end',
+  seconds,
+  caption: END_CAPTION,
+  frame: (t, ctx) => ctx.last(1 + t * 0.04),
+});
+
+/** A slow turn round a body, framed from the lit side. */
+const orbitBeat = (name, key, caption, { seconds = 5, distance = 2.6, phase = 40, tilt = 12, turn = 0.35, wait = false } = {}) => ({
+  name,
+  seconds,
+  caption,
+  async setup(page, ctx) {
+    if (wait) {
+      await page.evaluate((k) => window.cosminova.target(k), key);
+      await page.waitForFunction((k) => Boolean(window.cosminova.planets.get(k.replace(/^exo:/, '')) || window.cosminova.exoSystem?.planets?.some((p) => p.spec.key === k)), { timeout: 90000 }, key);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    ctx.base = await page.evaluate((k, d, p, tl) => {
+      const sv = window.cosminova;
+      sv.lookFromSun(k, d, p, tl);
+      return { yaw: sv.controls.yaw, pitch: sv.controls.pitch };
+    }, key, distance, phase, tilt);
+    const base = ctx.base;
+    ctx.last = (s) => ({ distanceRadii: distance * 0.9 / s, yaw: base.yaw + turn, pitch: base.pitch, fov: 40 });
+  },
+  frame: (t, ctx) => ({ distanceRadii: distance * (1 - 0.1 * t), yaw: ctx.base.yaw + turn * t, pitch: ctx.base.pitch, fov: 40 }),
+});
+
+SHOTS['short-earth-moon'] = {
+  date: '2026-10-05T12:00:00.000Z',
+  views: { distantMarkers: true },
+  labels: { earth: 'Earth', moon: 'Moon' },
+  beats: [
+    {
+      name: 'hook',
+      seconds: 3,
+      caption: 'This is the real distance\nbetween Earth and the Moon.',
+      async setup(page, ctx) {
+        ctx.base = await page.evaluate(async () => {
+          const sv = window.cosminova;
+          sv.target('earth', 120);
+          const c = sv.controls;
+          const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+          const where = (key) => {
+            const v = new sv.camera.position.constructor();
+            sv.planets.get(key).group.getWorldPosition(v);
+            return v.project(sv.camera);
+          };
+          let best = null;
+          for (let yi = 0; yi < 24; yi++) {
+            for (const pitch of [-0.5, -0.25, 0, 0.25, 0.5]) {
+              c.stopFlight();
+              c.fov = 70; c.distanceRadii = 120; c.yaw = (yi / 24) * Math.PI * 2; c.pitch = pitch;
+              c.lookYaw = 0; c.lookPitch = 0;
+              await frame();
+              const m = where('moon');
+              if (m.z > 1 || Math.abs(m.x) > 0.75 || Math.abs(m.y) > 0.62) continue;
+              // Lit side towards us: the camera on the Sun's side of the pair.
+              const sun = sv.universe.get('sun').position;
+              const e = sv.universe.get('earth').position;
+              const toSun = [sun.x - e.x, sun.y - e.y, sun.z - e.z];
+              const cam = c.worldPosition;
+              const toCam = [cam.x - e.x, cam.y - e.y, cam.z - e.z];
+              const lit = (toSun[0] * toCam[0] + toSun[1] * toCam[1] + toSun[2] * toCam[2])
+                / Math.hypot(...toSun) / Math.hypot(...toCam);
+              const score = Math.hypot(m.x, m.y * 1.6) + lit * 0.8;
+              if (!best || score > best.score) best = { score, yaw: c.yaw, pitch };
+            }
+          }
+          return best ?? { yaw: c.yaw, pitch: c.pitch };
+        });
+        ctx.last = () => ({ distanceRadii: 120, yaw: ctx.base.yaw, pitch: ctx.base.pitch, fov: 70 });
+        ctx.lookYaw = 0;
+      },
+      frame: (t, ctx) => ({ distanceRadii: glide(3, 6, t), yaw: ctx.base.yaw, pitch: ctx.base.pitch, fov: 40 }),
+    },
+    {
+      name: 'pull',
+      seconds: 9,
+      ease: arrive,
+      caption: 'About 30 Earths\nfit in the gap.',
+      frame: (t, ctx) => {
+        return { distanceRadii: glide(6, 120, t), yaw: ctx.base.yaw, pitch: ctx.base.pitch, fov: lerp(40, 70, t) };
+      },
+    },
+    {
+      name: 'payoff',
+      seconds: 6,
+      caption: '384,400 km.\nMost diagrams hide this gap.',
+      frame: (t, ctx) => ctx.last(),
+    },
+    endCard(),
+  ],
+};
+
+const stand = (body, sun, alt, view) => ({ stand: { body, sunElevationDeg: sun, altitudeKm: alt, viewElevationDeg: view, fov: 62 } });
+SHOTS['short-mars-sunset'] = {
+  date: '2026-06-21T17:00:00.000Z',
+  beats: [
+    {
+      name: 'earth',
+      seconds: 5,
+      caption: 'On Earth, sunsets are red.',
+      async setup(page) {
+        await page.evaluate(() => window.cosminova.standAt('earth', { sunElevationDeg: 4, altitudeKm: 2.5, viewElevationDeg: 9 }));
+        await page.evaluate(() => window.cosminova.loadDetail('earth'));
+      },
+      frame: (t) => stand('earth', lerp(4, 0.6, t), 2.5, 9),
+    },
+    {
+      name: 'mars',
+      seconds: 7,
+      caption: 'On Mars, they turn blue.',
+      async setup(page) {
+        await page.evaluate(() => window.cosminova.standAt('mars', { sunElevationDeg: 5, altitudeKm: 4, viewElevationDeg: 8 }));
+        await page.evaluate(() => window.cosminova.loadDetail('mars'));
+      },
+      frame: (t) => stand('mars', lerp(5, 2, t), 4, 8),
+    },
+    {
+      name: 'why',
+      seconds: 7,
+      caption: 'Fine dust scatters blue light\nforward, around the Sun.',
+      frame: (t) => stand('mars', lerp(2, 0.6, t), 4, 8),
+    },
+    { ...endCard(), frame: () => stand('mars', 0.6, 4, 8) },
+  ],
+};
+
+/**
+ * Each body in turn hung where the Moon is, 384,400 km up, over a night
+ * horizon. It is set opposite the Sun rather than where the Moon really is, so
+ * it is fully lit and the standing point keeps the horizon level; the Moon goes
+ * to wherever the body was.
+ */
+const MOON_KM = 384400;
+const ELEV = 34;
+const SWAP_STAND = { sunElevationDeg: -24, altitudeKm: 0.4, azimuthDeg: 180, viewElevationDeg: 28, fov: 62 };
+/**
+ * A night foreground drawn over the horizon: a hill line, pines, a broadleaf
+ * tree and a house with a lit window. The ground the engine draws at this scale
+ * is a flat black band, and a silhouette against the sky is what a real night
+ * photograph of a rising moon looks like anyway. Kept to the middle third where
+ * it matters so a 9:16 crop from the centre still has the house and a tree.
+ */
+function foregroundSvg(horizon) {
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const W = 1920, H = 1080, y0 = horizon * H;
+  const pine = (x, h, w) => {
+    const base = y0 + 18 + rnd() * 14;
+    const pts = [[x, base - h]];
+    const tiers = 9;
+    for (let i = 1; i <= tiers; i++) {
+      const y = base - h + (h * 0.92 * i) / tiers;
+      const half = (w / 2) * (i / tiers) * (0.8 + rnd() * 0.4);
+      pts.push([x + half, y], [x + half * 0.45, y - 4]);
+    }
+    const right = pts.slice(1);
+    const left = right.map(([px, py]) => [2 * x - px + (rnd() - 0.5) * 3, py]).reverse();
+    const poly = [pts[0], ...right, [x + 3, base], [x - 3, base], ...left];
+    return `<polygon points="${poly.map((p) => p.map((n) => n.toFixed(1)).join(',')).join(' ')}"/>`;
+  };
+  const blobTree = (x, h, r) => {
+    const base = y0 + 30;
+    let s = `<rect x="${x - 6}" y="${base - h * 0.55}" width="12" height="${h * 0.55}"/>`;
+    for (let i = 0; i < 26; i++) {
+      const a = rnd() * Math.PI * 2, d = rnd() * r * 0.75;
+      s += `<circle cx="${(x + Math.cos(a) * d * 1.2).toFixed(1)}" cy="${(base - h * 0.62 + Math.sin(a) * d * 0.8).toFixed(1)}" r="${(r * (0.32 + rnd() * 0.3)).toFixed(1)}"/>`;
+    }
+    return s;
+  };
+  let hill = `M0 ${H} L0 ${y0 + 34}`;
+  for (let x = 0; x <= W; x += 40) {
+    hill += ` L${x} ${(y0 + 26 + Math.sin(x / 260) * 9 + Math.sin(x / 71) * 3).toFixed(1)}`;
+  }
+  hill += ` L${W} ${H} Z`;
+  let trees = '';
+  for (const [x, h] of [[90, 210], [160, 160], [230, 250], [300, 180], [1540, 190], [1610, 260], [1690, 170], [1770, 230], [1850, 200]]) {
+    trees += pine(x, h, h * 0.42);
+  }
+  trees += pine(1110, 230, 92) + pine(1160, 175, 74) + pine(700, 150, 62);
+  trees += blobTree(1265, 250, 70);
+  const hx = 790, hy = y0 + 30;
+  const house = `
+    <rect x="${hx}" y="${hy - 70}" width="150" height="70"/>
+    <polygon points="${hx - 14},${hy - 68} ${hx + 75},${hy - 128} ${hx + 164},${hy - 68}"/>
+    <rect x="${hx + 112}" y="${hy - 128}" width="16" height="40"/>
+    <rect x="${hx + 22}" y="${hy - 52}" width="26" height="22" fill="#ffbf6a" filter="url(#glow)"/>
+    <rect x="${hx + 98}" y="${hy - 52}" width="26" height="22" fill="#f4a750" filter="url(#glow)"/>
+    <rect x="${hx + 64}" y="${hy - 42}" width="20" height="42" fill="#0a0806"/>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMax slice"
+      style="position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:9000">
+    <defs>
+      <linearGradient id="haze" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#1b2433" stop-opacity="0"/>
+        <stop offset="1" stop-color="#2a3448" stop-opacity="0.55"/>
+      </linearGradient>
+      <filter id="glow" x="-200%" y="-200%" width="500%" height="500%">
+        <feGaussianBlur stdDeviation="6" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
+    <rect x="0" y="${y0 - 120}" width="${W}" height="160" fill="url(#haze)"/>
+    <g fill="#030406">${trees}${house}<path d="${hill}"/></g>
+  </svg>`;
+}
+
+/**
+ * A backlit street edge for sunrise shots: a two-storey house with a porch and
+ * dormer, a fence, a power pole with sagging lines, and broadleaf trees grown
+ * by branching rather than drawn as blobs. Facing the star, all of it is in
+ * silhouette, which is what a camera pointed at a sunrise records.
+ */
+function townSvg(horizon) {
+  let seed = 11;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const W = 1920, H = 1080, y0 = horizon * H;
+  const f = (n) => n.toFixed(1);
+  let branches = '';
+  let leaves = '';
+  const grow = (x, y, len, ang, width, depth) => {
+    const x2 = x + Math.cos(ang) * len, y2 = y - Math.sin(ang) * len;
+    branches += `<path d="M${f(x)} ${f(y)} L${f(x2)} ${f(y2)}" stroke-width="${f(width)}"/>`;
+    if (depth <= 3) {
+      for (let i = 0; i < 9 - depth * 2; i++) {
+        leaves += `<circle cx="${f(x2 + (rnd() - 0.5) * 34)}" cy="${f(y2 + (rnd() - 0.5) * 26)}" r="${f(6 + rnd() * 8)}"/>`;
+      }
+      if (depth === 0) return;
+    }
+    const n = depth > 3 ? 2 : 2 + (rnd() > 0.5 ? 1 : 0);
+    for (let i = 0; i < n; i++) {
+      const spread = (i / (n - 1 || 1) - 0.5) * 1.1 + (rnd() - 0.5) * 0.35;
+      grow(x2, y2, len * (0.68 + rnd() * 0.14), ang + spread, width * 0.66, depth - 1);
+    }
+  };
+  grow(1290, y0 + 40, 92, Math.PI / 2 + 0.05, 16, 6);
+  grow(330, y0 + 42, 70, Math.PI / 2 - 0.08, 12, 6);
+  grow(1720, y0 + 44, 80, Math.PI / 2 + 0.1, 14, 6);
+
+  const ground = y0 + 40;
+  const hx = 720, hw = 300, wall = 150;
+  const roofTop = ground - wall - 110;
+  const win = (x, y, w, h, lit) => `
+    <rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${lit ? '#ffcf86' : '#2a1d14'}" ${lit ? 'filter="url(#warm)"' : ''}/>
+    <path d="M${x + w / 2} ${y} V${y + h} M${x} ${y + h / 2} H${x + w}" stroke="#050505" stroke-width="3"/>
+    <rect x="${x - 4}" y="${y + h}" width="${w + 8}" height="5"/>`;
+  const house = `
+    <rect x="${hx}" y="${ground - wall}" width="${hw}" height="${wall}"/>
+    <polygon points="${hx - 22},${ground - wall + 4} ${hx + hw / 2},${roofTop} ${hx + hw + 22},${ground - wall + 4}"/>
+    <rect x="${hx + 205}" y="${roofTop + 10}" width="26" height="70"/>
+    <rect x="${hx + 200}" y="${roofTop + 4}" width="36" height="10"/>
+    <polygon points="${hx + 100},${ground - wall - 30} ${hx + 130},${ground - wall - 62} ${hx + 160},${ground - wall - 30}"/>
+    <rect x="${hx + 106}" y="${ground - wall - 34}" width="48" height="38"/>
+    ${win(hx + 116, ground - wall - 26, 28, 24, false)}
+    ${win(hx + 34, ground - wall + 22, 46, 40, true)}
+    ${win(hx + 220, ground - wall + 22, 46, 40, false)}
+    ${win(hx + 34, ground - 62, 46, 40, false)}
+    <rect x="${hx + 120}" y="${ground - 78}" width="40" height="78" fill="#1a120c"/>
+    <polygon points="${hx + 90},${ground - 84} ${hx + 140},${ground - 104} ${hx + 190},${ground - 84}"/>
+    <rect x="${hx + 94}" y="${ground - 84}" width="6" height="84"/><rect x="${hx + 180}" y="${ground - 84}" width="6" height="84"/>
+    <rect x="${hx + 210}" y="${ground - 36}" width="100" height="5"/>`;
+  let fence = '';
+  for (let x = 380; x < 700; x += 18) fence += `<rect x="${x}" y="${ground - 34 + (rnd() - 0.5) * 3}" width="7" height="36"/>`;
+  for (let x = 1060; x < 1220; x += 18) fence += `<rect x="${x}" y="${ground - 34 + (rnd() - 0.5) * 3}" width="7" height="36"/>`;
+  fence += `<rect x="380" y="${ground - 26}" width="320" height="4"/><rect x="1060" y="${ground - 26}" width="160" height="4"/>`;
+  const pole = (x) => `<rect x="${x - 5}" y="${ground - 280}" width="10" height="280"/><rect x="${x - 40}" y="${ground - 268}" width="80" height="7"/>`;
+  const wires = [0, 1, 2].map((i) => {
+    const y = ground - 266 + i * 0;
+    const dx = -30 + i * 30;
+    return `<path d="M${-40} ${y + 40} Q${(-40 + 520 + dx) / 2} ${y + 70} ${520 + dx} ${y} Q${(520 + dx + 1560 + dx) / 2} ${y + 60} ${1560 + dx} ${y} Q${(1560 + dx + 1980) / 2} ${y + 50} 1980 ${y + 30}"
+      fill="none" stroke="#050505" stroke-width="2"/>`;
+  }).join('');
+  let hill = `M0 ${H} L0 ${ground + 4}`;
+  for (let x = 0; x <= W; x += 40) hill += ` L${x} ${f(ground + Math.sin(x / 300) * 5 + Math.sin(x / 77) * 2)}`;
+  hill += ` L${W} ${H} Z`;
+  let bushes = '';
+  for (const bx of [700, 1040, 560, 1230]) {
+    for (let i = 0; i < 6; i++) bushes += `<circle cx="${f(bx + (rnd() - 0.5) * 50)}" cy="${f(ground - 8 - rnd() * 14)}" r="${f(12 + rnd() * 10)}"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMax slice"
+      style="position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:9000">
+    <defs>
+      <filter id="warm" x="-100%" y="-100%" width="300%" height="300%">
+        <feGaussianBlur stdDeviation="5" result="b"/>
+        <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <linearGradient id="mist" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.35"/>
+      </linearGradient>
+    </defs>
+    <g fill="#07080a" stroke="#07080a">
+      <g transform="translate(40 ${ground}) scale(0.4) translate(-250 ${-ground})">
+      <g stroke-linecap="round">${branches}</g><g stroke="none">${leaves}</g>
+      <g transform="translate(${hx + hw / 2} ${ground}) scale(1.35) translate(${-(hx + hw / 2)} ${-ground})">${house}</g>${fence}${bushes}</g><path d="${hill}" stroke="none"/>
+    </g>
+  </svg>`;
+}
+
+async function nightScene(page, horizon, svgFor = foregroundSvg) {
+  await page.evaluate((svg) => {
+    const sv = window.cosminova;
+    sv.setView('galaxies', false);
+    sv.setView('blackHoles', false);
+    sv.scene.traverse((o) => {
+      const u = o.material?.uniforms;
+      if (u && (u.uCavity || u.uBipolar)) {
+        Object.defineProperty(o, 'visible', { get: () => false, set() {}, configurable: true });
+      }
+    });
+    if (!document.getElementById('__fg')) {
+      const host = document.createElement('div');
+      host.id = '__fg';
+      host.innerHTML = svg;
+      document.body.append(host);
+    }
+  }, svgFor(horizon));
+}
+
+/**
+ * Another star in the Sun's place, rising over a street and climbing. Each
+ * beat is a sunrise: the star's centre comes up from below the horizon and
+ * keeps going, with the view held on its bearing.
+ */
+const STARS = {
+  sun: {},
+  sirius: { scale: 1.71, disc: [0.86, 0.92, 1.25], light: [0.84, 0.9, 1.0], boost: 2.2 },
+  proxima: { scale: 0.154, disc: [1.0, 0.36, 0.12], light: [1.0, 0.42, 0.2], boost: 0.25 },
+  // Really 764 solar radii, which is 3.5 AU: Earth would be inside it. Shown
+  // at 0.37 AU so there is a disc to see rise at all, and said so on screen.
+  // A black hole of one solar mass is 6 km across: no disc, no light, and
+  // Earth's orbit would not change.
+  blackhole: { scale: 1e-6, boost: 0, dark: true },
+  betelgeuse: { scale: 80, disc: [1.0, 0.2, 0.04], light: [1.0, 0.4, 0.18], boost: 1.5, lumpy: 0.06 },
+};
+function riseBeat(key, seconds, [from, to], view = 12) {
+  return {
+    name: key,
+    seconds,
+    async setup(page) {
+      await nightScene(page, 0.763, townSvg);
+      await page.evaluate((spec) => window.cosminova.swapSun(spec), STARS[key]);
+    },
+    // Of the two level-horizon standing points, each comes out upside down on
+    // one side of the horizon, so the star crossing it swaps between them.
+    frame: (t) => {
+      const sunElevationDeg = lerp(from, to, t);
+      // Stars belong to the night: once any of the disc clears the horizon
+      // they go, however low its centre still is.
+      const radiusDeg = (Math.asin(Math.min((STARS[key].scale ?? 1) * 696000 / 1.496e8, 1)) * 180) / Math.PI;
+      const night = STARS[key].dark || sunElevationDeg + radiusDeg < -1;
+      return { veil: !night, stand: { body: 'earth', sunElevationDeg, altitudeKm: 0.3, viewElevationDeg: view, fov: 62, rollDeg: sunElevationDeg < 0 ? 180 : 0 } };
+    },
+  };
+}
+SHOTS['sun-swap'] = {
+  date: '2026-06-21T12:00:00.000Z',
+  views: { distantMarkers: false },
+  beats: [
+    riseBeat('sun', 7, [-2, 12], 20),
+    riseBeat('sirius', 7, [-2, 12], 20),
+    riseBeat('proxima', 7, [-2, 12], 20),
+    riseBeat('betelgeuse', 10, [-26, 14], 20),
+    riseBeat('blackhole', 8, [-2, 30], 20),
+  ],
+};
+SHOTS['sun-swap-test'] = {
+  date: '2026-06-21T12:00:00.000Z',
+  views: { distantMarkers: false },
+  beats: [riseBeat('betelgeuse', 10, [-26, 14], 20)],
+};
+
+function swapBeat(key, seconds, fov = [62, 62]) {
+  return {
+    name: key,
+    seconds,
+    async setup(page, ctx) {
+      await nightScene(page, 0.915);
+      ctx.look = await page.evaluate((key, stand, elev, km) => {
+        const sv = window.cosminova;
+        const u = sv.universe;
+        if (!u.__swapped) {
+          const orig = u.update.bind(u);
+          u.update = (d) => {
+            orig(d);
+            const s = u.__swap;
+            if (!s) return;
+            const earth = u.get('earth').position;
+            const body = u.get(s.key).position;
+            if (s.key !== 'moon') u.get('moon').position.set(0, 6e9, 0);
+            body.copy(earth).add(s.offset);
+          };
+          u.__swapped = true;
+        }
+        u.__swap = null;
+        sv.target(key, 3.2);
+        u.update(sv.state.date);
+        sv.standAt('earth', stand);
+        const c = sv.controls;
+        const V = sv.camera.position.constructor;
+        const dir = new V(Math.sin(c.yaw) * Math.cos(c.pitch), Math.sin(c.pitch), Math.cos(c.yaw) * Math.cos(c.pitch));
+        const earth = u.get('earth').position;
+        const eye = earth.clone().addScaledVector(dir, c.distanceRadii * 6371);
+        const toSun = u.get('sun').position.clone().sub(eye).normalize();
+        const away = toSun.addScaledVector(dir, -toSun.dot(dir)).normalize().negate();
+        const e = (elev * Math.PI) / 180;
+        const want = away.multiplyScalar(Math.cos(e)).addScaledVector(dir, Math.sin(e));
+        u.__swap = { key, offset: eye.clone().addScaledVector(want, km).sub(earth) };
+        u.update(sv.state.date);
+        return { lookYaw: c.lookYaw, lookPitch: c.lookPitch };
+      }, key, SWAP_STAND, ELEV, MOON_KM);
+    },
+    frame: (t, ctx) => ({ fov: glide(fov[0], fov[1], t), ...ctx.look }),
+  };
+}
+SHOTS['moon-swap'] = {
+  date: '2026-11-10T06:00:00.000Z',
+  views: { distantMarkers: false },
+  beats: [
+    swapBeat('moon', 6),
+    swapBeat('mars', 5),
+    swapBeat('venus', 5),
+    swapBeat('neptune', 5),
+    swapBeat('uranus', 5),
+    swapBeat('jupiter', 7),
+    swapBeat('saturn', 9),
+  ],
+};
+
+SHOTS['short-megaparsecs'] = {
+  date: '2026-10-05T12:00:00.000Z',
+  beats: [
+    {
+      name: 'galaxy',
+      seconds: 5,
+      caption: 'Fornax A.\n60 million light-years away.',
+      async setup(page, ctx) {
+        ctx.base = await page.evaluate(() => {
+          const sv = window.cosminova;
+          sv.target('gal:NGC 1316', 3);
+          return { yaw: sv.controls.yaw, pitch: sv.controls.pitch };
+        });
+      },
+      frame: (t, ctx) => ({ distanceRadii: glide(3.2, 2.2, t), yaw: ctx.base.yaw + 0.3 * t, pitch: ctx.base.pitch, fov: 45 }),
+    },
+    orbitBeat('planet', 'exo:fornax-a-eta-b', 'At this distance, even 64-bit\nnumbers are 65,000 km apart.', { seconds: 7, distance: 6, wait: true }),
+    {
+      name: 'jitter',
+      seconds: 6,
+      caption: 'A planet would shake\non that grid.',
+      frame: (t, ctx) => ({ distanceRadii: 5.4 * (1 - 0.05 * t), yaw: ctx.base.yaw + 0.35 + 0.15 * t, pitch: ctx.base.pitch, fov: 40 }),
+    },
+    {
+      name: 'fix',
+      seconds: 6,
+      caption: 'So Cosminova measures\nfrom the camera instead.',
+      frame: (t, ctx) => ({ distanceRadii: 5.13 * (1 - 0.05 * t), yaw: ctx.base.yaw + 0.5 + 0.15 * t, pitch: ctx.base.pitch, fov: 40 }),
+    },
+    { ...endCard(), frame: (t, ctx) => ({ distanceRadii: 4.9, yaw: ctx.base.yaw + 0.65 + 0.05 * t, pitch: ctx.base.pitch, fov: 40 }) },
+  ],
+};
+
+SHOTS['short-points-of-light'] = {
+  date: '2026-10-05T12:00:00.000Z',
+  beats: [
+    {
+      name: 'dot',
+      seconds: 4,
+      caption: 'That bright dot is Sirius.',
+      async setup(page, ctx) {
+        ctx.base = await page.evaluate(() => {
+          const sv = window.cosminova;
+          sv.target('star:Sirius', 6e7);
+          return { yaw: sv.controls.yaw, pitch: sv.controls.pitch };
+        });
+      },
+      frame: (t, ctx) => ({ distanceRadii: glide(6.8e7, 4e7, t), yaw: ctx.base.yaw, pitch: ctx.base.pitch, fov: 50 }),
+    },
+    {
+      name: 'fly',
+      seconds: 9,
+      ease: arrive,
+      caption: '8.6 light-years away.\nLet\u2019s go.',
+      frame: (t, ctx) => ({ distanceRadii: glide(4e7, 9, t), yaw: ctx.base.yaw + 0.25 * t, pitch: ctx.base.pitch, fov: 50 }),
+    },
+    {
+      name: 'payoff',
+      seconds: 6,
+      caption: 'Every point of light\nis somewhere you can visit.',
+      frame: (t, ctx) => ({ distanceRadii: glide(9, 7, t), yaw: ctx.base.yaw + 0.25 + 0.1 * t, pitch: ctx.base.pitch, fov: 50 }),
+    },
+    { ...endCard(), frame: (t, ctx) => ({ distanceRadii: 7, yaw: ctx.base.yaw + 0.35 + 0.05 * t, pitch: ctx.base.pitch, fov: 50 }) },
+  ],
+};
+
+SHOTS['short-real-modeled'] = {
+  date: '2026-10-05T12:00:00.000Z',
+  beats: [
+    orbitBeat('real', 'moon', 'REAL\nMoon terrain, measured from orbit.', { seconds: 6, distance: 5.5, phase: 55, tilt: 14 }),
+    orbitBeat('modeled', 'venus', 'MODELED\nVenus\u2019s clouds, from physics.', { seconds: 6, distance: 6 }),
+    orbitBeat('generated', 'exo:trappist-1-e', 'GENERATED\nTRAPPIST-1 e. Real size, invented ground.', { seconds: 7, distance: 6, wait: true }),
+    {
+      name: 'honest',
+      seconds: 4,
+      caption: 'Every object says\nwhich one it is.',
+      frame: (t, ctx) => ctx.last(1 + t * 0.05),
+    },
+    endCard(),
+  ],
+};
+
+SHOTS['short-drift'] = {
+  date: '2026-10-05T12:00:00.000Z',
+  beats: [
+    orbitBeat('saturn', 'saturn', 'What deep space\nsounds like.', { seconds: 6, distance: 6.5, phase: 35, tilt: 14, turn: 0.4 }),
+    {
+      name: 'listen',
+      seconds: 9,
+      caption: '',
+      frame: (t, ctx) => ({ distanceRadii: 5.85 * (1 - 0.08 * t), yaw: ctx.base.yaw + 0.4 + 0.5 * t, pitch: ctx.base.pitch, fov: 40 }),
+    },
+    {
+      name: 'live',
+      seconds: 6,
+      caption: 'The music is generated\nlive, as you fly.',
+      frame: (t, ctx) => ({ distanceRadii: 5.4 * (1 - 0.05 * t), yaw: ctx.base.yaw + 0.9 + 0.3 * t, pitch: ctx.base.pitch, fov: 40 }),
+    },
+    { ...endCard(4), frame: (t, ctx) => ({ distanceRadii: 5.13, yaw: ctx.base.yaw + 1.2 + 0.2 * t, pitch: ctx.base.pitch, fov: 40 }) },
+  ],
+};
+
+for (const [key, value] of Object.entries((await import('./kit-shots.mjs')).kitShots())) {
+  if (value) SHOTS[key] = value;
+}
+
+const shot = SHOTS[SHOT_NAME];
+if (!shot) {
+  console.error(`no shot called "${SHOT_NAME}". known: ${Object.keys(SHOTS).join(', ')}`);
+  process.exit(1);
+}
+
+const totalSeconds = shot.beats.reduce((s, b) => s + b.seconds, 0);
+if (COUNT) {
+  console.log(shot.beats.reduce((n, b) => n + Math.round(b.seconds * FPS), 0));
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Page setup
+// ---------------------------------------------------------------------------
+
+if (!SLICED) fs.rmSync(FRAME_DIR, { recursive: true, force: true });
+fs.mkdirSync(FRAME_DIR, { recursive: true });
+
+const browser = await puppeteer.launch({
+  executablePath: CHROME,
+  args: ['--headless=new', '--no-sandbox', '--use-gl=angle', '--hide-scrollbars',
+    ...(process.env.CHROME_ARGS ?? '').split(' ').filter(Boolean)],
+  protocolTimeout: 600000,
+  defaultViewport: { width: Math.round(WIDTH), height: Math.round(HEIGHT), deviceScaleFactor: 1 },
+});
+const page = await browser.newPage();
+const errors = [];
+page.on('pageerror', (e) => errors.push(e.message));
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+
+console.log(`rendering "${SHOT_NAME}" — ${totalSeconds}s at ${FPS} fps, `
+  + `${Math.round(WIDTH)}x${Math.round(HEIGHT)}${PREVIEW ? ' (preview)' : ''}`);
+
+await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+await page.waitForFunction(() => window.cosminova?.ready === true, { timeout: 180000 });
+// A cold dev server optimises dependencies on first load and reloads the page
+// once it has; wait that out rather than have it land mid-shot.
+await new Promise((r) => setTimeout(r, 8000));
+await page.waitForFunction(() => window.cosminova?.ready === true, { timeout: 180000 });
+
+await page.evaluate(({ date, brand, site, views, labels, preset }) => {
+  const sv = window.cosminova;
+  sv.setRate(0);
+  sv.setDate(date);
+  sv.setUiVisible(false);
+  // Overlays are for navigating, not for looking at. A trajectory ribbon drawn
+  // on the celestial sphere cuts a bright curve straight across a landscape.
+  for (const key of ['craft', 'trajectories', 'craftVectors', 'distantMarkers']) sv.setView(key, false);
+  for (const key of [
+    'labelPlanets', 'labelStars', 'labelGalaxies', 'labelBlackHoles', 'labelCraft', 'labelExo',
+  ]) sv.setView(key, false);
+  // Pin the detail. Left on auto, the governor trims terrain and resolution
+  // whenever a frame runs long, which in a render is most of them — and the
+  // trimming would be visible as the picture softening and recovering.
+    sv.setQuality?.(preset) ?? sv.quality?.setPreset?.(preset);
+
+  const style = document.createElement('style');
+  style.textContent = `
+    .immersive-hint, .loading { display: none !important; }
+    #__cap {
+      position: fixed; left: 0; right: 0; bottom: 12%;
+      display: flex; justify-content: center; padding: 0 7%;
+      pointer-events: none; z-index: 99999;
+    }
+    #__capText {
+      font: 700 clamp(26px, 5.4vw, 66px)/1.28 var(--font, 'Inter', system-ui, sans-serif);
+      color: #fff; text-align: center; letter-spacing: -0.01em; white-space: pre-line;
+      text-shadow: 0 3px 24px rgba(0,0,0,0.92), 0 0 6px rgba(0,0,0,0.95);
+      opacity: 0; transition: none;
+    }
+    #__brand {
+      position: fixed; left: 0; right: 0; top: 6.5%; text-align: center;
+      font: 700 clamp(20px, 3.8vw, 46px)/1.2 var(--font, 'Inter', system-ui, sans-serif);
+      color: #fff; letter-spacing: 0.18em; text-transform: uppercase;
+      text-shadow: 0 3px 20px rgba(0,0,0,0.95); opacity: 0; z-index: 99999;
+      pointer-events: none;
+    }
+    #__brand small {
+      display: block; margin-top: 0.5em; font-size: 0.62em; letter-spacing: 0.06em;
+      text-transform: none; font-weight: 500; opacity: 0.85;
+    }
+  `;
+  document.head.append(style);
+
+  const cap = document.createElement('div');
+  cap.id = '__cap';
+  cap.innerHTML = '<div id="__capText"></div>';
+  document.body.append(cap);
+
+  const bd = document.createElement('div');
+  bd.id = '__brand';
+  if (brand) bd.innerHTML = `${brand}${site ? `<small>${site}</small>` : ''}`;
+  document.body.append(bd);
+
+  window.__caption = (text, opacity) => {
+    const node = document.getElementById('__capText');
+    if (node.textContent !== text) node.textContent = text;
+    node.style.opacity = String(opacity);
+  };
+  window.__brand = (opacity) => {
+    if (!brand) return;
+    document.getElementById('__brand').style.opacity = String(opacity);
+  };
+
+  /** Place the camera exactly. Anything the app might be doing on its own is
+   *  cancelled first, or it fights the keyframes. */
+  window.__place = (s) => {
+    const sv = window.cosminova;
+    const c = sv.controls;
+    c.stopFlight();
+    c.cruise = 0;
+    c.zoomVelocity = 0;
+    c.yawVelocity = 0;
+    c.pitchVelocity = 0;
+    if (s.date) sv.setDate(s.date);
+    // A beat standing on a surface hands over the whole placement, because the
+    // spot to stand on to see the sun at a given height moves as the sun does,
+    // and this is what recomputes it. The sun setting over the beat is the
+    // elevation being wound down frame by frame.
+    if (s.views) for (const [key, on] of Object.entries(s.views)) sv.setView(key, on);
+    if (s.veil !== undefined) {
+      if (!s.veil && sv.state.forceVeil) sv.setView('milkyWay', true);
+      sv.state.forceVeil = s.veil;
+    }
+    if (s.stand) {
+      const { body, ...options } = s.stand;
+      sv.standAt(body, options);
+      return;
+    }
+    if (s.fov !== undefined) c.fov = s.fov;
+    if (s.distanceRadii !== undefined) c.distanceRadii = s.distanceRadii;
+    if (s.yaw !== undefined) c.yaw = s.yaw;
+    if (s.pitch !== undefined) c.pitch = s.pitch;
+    c.lookYaw = s.lookYaw ?? 0;
+    c.lookPitch = s.lookPitch ?? 0;
+  };
+  for (const [key, on] of Object.entries(views ?? {})) sv.setView(key, on);
+  // Name tags that follow a body, for shots where it is a few pixels across.
+  const tags = Object.entries(labels ?? {}).map(([key, name]) => {
+    const node = document.createElement('div');
+    node.textContent = name;
+    node.style.cssText = 'position:fixed;z-index:99998;pointer-events:none;color:#fff;'
+      + 'font:600 clamp(16px,3.2vw,38px)/1 var(--font,Inter,system-ui,sans-serif);'
+      + 'text-shadow:0 2px 12px #000;transform:translate(-50%,-180%);opacity:0;';
+    document.body.append(node);
+    return { key, node };
+  });
+  window.__tags = (opacity) => {
+    for (const { key, node } of tags) {
+      const body = sv.planets.get(key);
+      if (!body) continue;
+      const v = new sv.camera.position.constructor();
+      body.group.getWorldPosition(v).project(sv.camera);
+      node.style.left = `${(v.x * 0.5 + 0.5) * innerWidth}px`;
+      node.style.top = `${(-v.y * 0.5 + 0.5) * innerHeight}px`;
+      node.style.opacity = v.z < 1 ? String(opacity) : '0';
+    }
+  };
+}, { date: shot.date, brand: BRAND, site: SITE, views: { orbits: false, ...shot.views }, labels: shot.labels, preset: process.env.LITE ? 'medium' : 'ultra' });
+
+/**
+ * Hold the frame until the scene has stopped arriving.
+ *
+ * Terrain streams in over several frames and textures upgrade behind it, so
+ * capturing immediately would record the low-detail version of every frame and
+ * the video would crawl with detail popping. Waiting for the patch count to
+ * stop changing is what makes the render look better than the live app rather
+ * than the same as it.
+ */
+async function settle(minMs, maxMs) {
+  const started = Date.now();
+  let last = -1;
+  let stable = 0;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 55));
+    const patches = await page.evaluate(() => window.cosminova.stats().patches);
+    if (patches === last) stable++;
+    else { stable = 0; last = patches; }
+    const waited = Date.now() - started;
+    if (stable >= 2 && waited >= minMs) return;
+    if (waited >= maxMs) return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+// ---------------------------------------------------------------------------
+
+const CAPTION_FADE = 0.45;
+const captions = [];
+let frameIndex = 0;
+let elapsed = 0;
+const ctx = {};
+const startedAt = Date.now();
+
+for (const beat of shot.beats) {
+  if (beat.setup) await beat.setup(page, ctx);
+  const frames = Math.round(beat.seconds * FPS);
+  if (beat.caption) {
+    captions.push({ from: elapsed + 0.15, to: elapsed + beat.seconds - 0.1, text: beat.caption });
+  }
+
+  for (let i = 0; i < frames; i++) {
+    if (frameIndex < FROM || frameIndex >= TO) {
+      frameIndex++;
+      continue;
+    }
+    const firstOfSlice = SLICED && frameIndex === FROM;
+    const t = frames === 1 ? 1 : i / (frames - 1);
+    // The clock is linear; the easing is the beat's own business, and most
+    // beats do not want any.
+    const state = beat.frame((beat.ease ?? linear)(t), ctx);
+    const seconds = beat.seconds * t;
+    // Fade the caption in at the head of its beat and out at the tail.
+    const fade = Math.min(
+      seconds / CAPTION_FADE,
+      (beat.seconds - seconds) / CAPTION_FADE,
+      1,
+    );
+    // The name comes up over the last beat, so the frame people stop on has it.
+    const isLast = beat === shot.beats[shot.beats.length - 1];
+    const brandOpacity = isLast ? Math.min(Math.max((t - 0.45) / 0.25, 0), 1) : 0;
+
+    await page.evaluate(
+      ({ s, text, opacity, brand }) => {
+        window.__place(s);
+        window.__caption(text, opacity);
+        window.__brand(brand);
+      },
+      { s: state, text: beat.caption ?? '', opacity: Math.max(fade, 0), brand: brandOpacity },
+    );
+
+    // Beats carrying streamed terrain are the ones worth waiting long for; a
+    // camera out in space has nothing left to arrive.
+    const onSurface = beat.name === 'descend' || Boolean(state.stand);
+    // A slice starting mid-shot arrives cold, with nothing streamed yet.
+    if (firstOfSlice) await settle(6000, 30000);
+    if (process.env.LITE) await settle(onSurface ? 60 : 0, onSurface ? 300 : 120);
+    else await settle(onSurface ? 220 : 90, onSurface ? 2200 : 900);
+    if (shot.labels) {
+      await page.evaluate(() => window.__tags(Math.min(Math.max((window.cosminova.controls.distanceRadii - 25) / 25, 0), 1)));
+    }
+
+    const file = path.join(FRAME_DIR, `f${String(frameIndex).padStart(5, '0')}.png`);
+    await page.screenshot({ path: file, type: 'png' });
+    frameIndex++;
+
+    if (frameIndex % 25 === 0 || frameIndex === 1) {
+      const total = Math.round(totalSeconds * FPS);
+      const per = (Date.now() - startedAt) / frameIndex / 1000;
+      const left = Math.round(((total - frameIndex) * per) / 6) / 10;
+      process.stdout.write(
+        `\r  frame ${frameIndex}/${total}  ${beat.name.padEnd(9)} `
+        + `${per.toFixed(2)}s/frame  ~${left} min left      `,
+      );
+    }
+  }
+  elapsed += beat.seconds;
+}
+process.stdout.write('\n');
+if (SLICED) {
+  await browser.close();
+  console.log(`  frames ${FROM}..${Math.min(TO, frameIndex) - 1} in ${FRAME_DIR}`);
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Score
+// ---------------------------------------------------------------------------
+
+/**
+ * The journey's own music, rendered offline from the app's synthesiser.
+ *
+ * The scene weights are stepped at the beat boundaries so the score travels
+ * with the camera — close and domestic on the ground, opening out through the
+ * crossing, settling onto the surface at the end.
+ */
+async function renderScore(seconds) {
+  return page.evaluate(async ({ seconds, base }) => {
+    const mod = await import(`${base}src/engine/ambient.js`);
+    const rate = 48000;
+    const ctx = new OfflineAudioContext(2, Math.ceil(rate * seconds), rate);
+    const ambient = mod.createAmbient({ context: ctx, autoResume: false, schedule: false });
+    const inner = ambient._internals;
+    // No wall clock in an offline render, so the long crossfades have to be
+    // collapsed or they never arrive inside the length of the piece.
+    inner.setGlideScale(0.015);
+    await ambient.start();
+
+    const arc = [
+      [0.00, { home: 1, leave: 0.06 }],
+      [0.14, { home: 0.5, leave: 0.85, deep: 0.15 }],
+      [0.37, { leave: 0.5, deep: 0.7, approach: 0.5, awe: 0.4, wonder: 0.3 }],
+      [0.46, { deep: 0.35, approach: 0.9, awe: 0.55, wonder: 0.5 }],
+      [0.72, { land: 0.9, approach: 0.25, home: 0.12, wonder: 0.25 }],
+    ];
+    inner.snap(arc[0][1]);
+    for (const [at, mix] of arc.slice(1)) {
+      ctx.suspend(at * seconds).then(() => {
+        try { inner.snap(mix); } catch { /* keep going: silence is worse */ }
+        ctx.resume();
+      });
+    }
+
+    const PHRASE = 8 * 0.86;
+    const count = Math.max(Math.floor((seconds - 0.6) / PHRASE), 1);
+    for (let i = 0; i < count; i++) {
+      ctx.suspend(0.3 + i * PHRASE).then(() => {
+        try {
+          if (i > 0 && i % 2 === 0) inner.nextChord();
+          inner.renderPhrase(ctx.currentTime);
+          if (i % 3 === 0) inner.strike('bell', 72, 0.018);
+          if (i % 2 === 0) inner.strike('shimmer', 84, 0.02);
+        } catch { /* a dropped phrase is a gap, not a failure */ }
+        ctx.resume();
+      });
+    }
+
+    const buffer = await ctx.startRendering();
+    const L = buffer.getChannelData(0);
+    const R = buffer.getChannelData(1);
+    const out = new Array(buffer.length * 2);
+    let peak = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      peak = Math.max(peak, Math.abs(L[i]), Math.abs(R[i]));
+    }
+    // Normalise to a hair under full scale: the score is mixed to sit under an
+    // app, and on a phone speaker that is inaudible.
+    const gain = peak > 1e-5 ? 0.89 / peak : 1;
+    // Ease the last second down so the piece ends rather than stopping.
+    const tail = Math.min(Math.floor(rate * 1.2), buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+      const fade = i > buffer.length - tail ? (buffer.length - i) / tail : 1;
+      const head = Math.min(i / (rate * 0.35), 1);
+      out[i * 2] = L[i] * gain * fade * head;
+      out[i * 2 + 1] = R[i] * gain * fade * head;
+    }
+    return { samples: out, rate, peak };
+  }, { seconds, base: URL });
+}
+
+function writeWav(file, interleaved, rate) {
+  const frames = interleaved.length / 2;
+  const buf = Buffer.alloc(44 + frames * 4);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + frames * 4, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(2, 22);
+  buf.writeUInt32LE(rate, 24);
+  buf.writeUInt32LE(rate * 4, 28);
+  buf.writeUInt16LE(4, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(frames * 4, 40);
+  for (let i = 0; i < interleaved.length; i++) {
+    const v = Math.max(-1, Math.min(1, interleaved[i]));
+    buf.writeInt16LE(Math.round(v * 32767), 44 + i * 2);
+  }
+  fs.writeFileSync(file, buf);
+}
+
+const audioFile = path.join(OUT_DIR, `${SHOT_NAME}.wav`);
+let haveAudio = false;
+try {
+  console.log('rendering the score ...');
+  const score = await renderScore(totalSeconds);
+  writeWav(audioFile, score.samples, score.rate);
+  haveAudio = true;
+  console.log(`  ${totalSeconds}s of music, peak ${(20 * Math.log10(score.peak || 1e-9)).toFixed(1)} dB before normalising`);
+} catch (err) {
+  console.log(`  no music: ${String(err.message).slice(0, 140)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Subtitles
+// ---------------------------------------------------------------------------
+
+const srtTime = (s) => {
+  const ms = Math.round(s * 1000);
+  const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
+  const m = String(Math.floor(ms / 60000) % 60).padStart(2, '0');
+  const sec = String(Math.floor(ms / 1000) % 60).padStart(2, '0');
+  return `${h}:${m}:${sec},${String(ms % 1000).padStart(3, '0')}`;
+};
+const srtFile = path.join(OUT_DIR, `${SHOT_NAME}.srt`);
+fs.writeFileSync(
+  srtFile,
+  captions
+    .map((c, i) => `${i + 1}\n${srtTime(c.from)} --> ${srtTime(c.to)}\n${c.text}\n`)
+    .join('\n'),
+);
+
+await browser.close();
+
+// ---------------------------------------------------------------------------
+// Encode
+// ---------------------------------------------------------------------------
+
+const outFile = path.join(OUT_DIR, `${SHOT_NAME}${LANDSCAPE ? '-wide' : ''}${PREVIEW ? '-preview' : ''}.mp4`);
+const ff = [
+  '-y',
+  '-framerate', String(FPS),
+  '-i', path.join(FRAME_DIR, 'f%05d.png'),
+  ...(haveAudio ? ['-i', audioFile] : []),
+  '-c:v', 'libx264',
+  '-preset', PREVIEW ? 'veryfast' : 'slow',
+  '-crf', PREVIEW ? '26' : '17',
+  '-pix_fmt', 'yuv420p',
+  ...(haveAudio ? ['-c:a', 'aac', '-b:a', '192k', '-shortest'] : []),
+  '-movflags', '+faststart',
+  outFile,
+];
+
+console.log('encoding ...');
+await new Promise((resolve, reject) => {
+  const proc = spawn(ffmpegPath, ff, { stdio: ['ignore', 'ignore', 'pipe'] });
+  let log = '';
+  proc.stderr.on('data', (d) => { log += d.toString(); });
+  proc.on('close', (code) => {
+    if (code === 0) resolve();
+    else reject(new Error(`ffmpeg exited ${code}\n${log.slice(-1500)}`));
+  });
+});
+
+if (!KEEP) fs.rmSync(FRAME_DIR, { recursive: true, force: true });
+
+const size = (fs.statSync(outFile).size / 1e6).toFixed(1);
+console.log(`\n  ${outFile}  ${size} MB  ${totalSeconds}s  ${Math.round(WIDTH)}x${Math.round(HEIGHT)}`);
+console.log(`  ${srtFile}  ${captions.length} captions`);
+if (haveAudio) console.log(`  ${audioFile}  score, generated — nothing to claim it`);
+if (errors.length) {
+  console.log('\n  console errors during the render:');
+  for (const e of [...new Set(errors)].slice(0, 5)) console.log(`    ${e.slice(0, 160)}`);
+}

@@ -1,0 +1,103 @@
+{
+  "name": "still-here",
+  "version": "1.0.1",
+  "description": "Still Here: a narrated journey to the machines NASA left behind on the Moon, on Mars and in deep space. Built on the Cosminova engine for the NASA Space Apps 2026 challenge 'Abandoned but not Forgotten'.",
+  "main": "desktop/main.cjs",
+  "scripts": {
+    "desktop": "npm run build && electron .",
+    "dist:win": "npm run build && electron-builder --win --publish never",
+    "build:site": "npm run build && node scripts/build-site.mjs",
+    "site:stills": "node scripts/site-stills.mjs",
+    "shots:store": "node scripts/store-shots.mjs",
+    "build:logo": "node scripts/build-logo.mjs",
+    "check:site": "node scripts/site-check.mjs",
+    "check:mobile": "node scripts/mobile-check.mjs",
+    "check:home": "node scripts/home-check.mjs",
+    "fetch:assets": "node scripts/fetch-assets.mjs",
+    "fetch:exo": "node scripts/fetch-exoplanets.mjs",
+    "perf": "node scripts/perf.mjs",
+    "build:data": "node scripts/build-data.mjs",
+    "build:tex": "node scripts/build-textures.mjs",
+    "build:mars": "node scripts/build-mars-dem.mjs",
+    "fetch:models": "node scripts/fetch-models.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "build:ios": "npm run build:mobile-assets && vite build --mode ios",
+    "build:mobile-assets": "node scripts/mobile-assets.mjs",
+    "preview:ios": "vite preview --outDir dist-ios --port 5181",
+    "preview": "vite preview",
+    "serve": "vite build && vite preview --host 0.0.0.0 --port 5180",
+    "verify": "node scripts/verify.mjs",
+    "shoot": "node scripts/shoot.mjs",
+    "check:ui": "node scripts/ui-check.mjs explorer && node scripts/ui-check.mjs sky",
+    "check:interact": "node scripts/ui-interact.mjs && node scripts/sky-interact.mjs",
+    "check:light": "node scripts/light-check.mjs",
+    "check:shape": "node scripts/shape-check.mjs",
+    "check:craft": "node scripts/craft-check.mjs",
+    "check:lod": "node scripts/lod-check.mjs",
+    "check:geology": "node scripts/geology-check.mjs",
+    "check:dest": "node scripts/dest-check.mjs",
+    "check:system": "node scripts/system-check.mjs",
+    "check:flight": "node scripts/flight-check.mjs",
+    "check:roam": "node scripts/roam-check.mjs",
+    "check:onboard": "node scripts/onboard-check.mjs",
+    "render:video": "node scripts/render-video.mjs",
+    "check:travel": "node scripts/travel-check.mjs",
+    "check:drag": "node scripts/drag-check.mjs",
+    "check:galaxy": "node scripts/galaxy-slab-check.mjs",
+    "check:star": "node scripts/star-check.mjs",
+    "check:sky": "node scripts/sky-check.mjs",
+    "check:zoom": "node scripts/zoom-check.mjs",
+    "check:relief": "node scripts/relief-check.mjs mars && node scripts/relief-check.mjs moon",
+    "check:glare": "node scripts/craft-glare-check.mjs",
+    "check:music": "node scripts/music-check.mjs",
+    "check:story": "node scripts/story-check.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "ffmpeg-static": "^5.3.0",
+    "puppeteer-core": "^25.9.0",
+    "sharp": "^0.35.4",
+    "vite": "^8.2.2"
+  },
+  "build": {
+    "appId": "org.spaceapps.stillhere",
+    "productName": "Still Here",
+    "copyright": "Still Here",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "StillHere-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Still Here"
+    }
+  }
+}
